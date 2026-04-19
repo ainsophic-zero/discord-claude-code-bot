@@ -1,0 +1,8 @@
+.env
+sessions.db
+venv/
+__pycache__/
+*.pyc
+workspaces/
+.DS_Store
+*.log
