@@ -1056,8 +1056,10 @@ async def _generate_daily_report(channel, channel_id: str, immediate: bool = Fal
         "--verbose",
         "--dangerously-skip-permissions",
     ]
-    env = {k: v for k, v in os.environ.items() if k != "DISCORD_TOKEN"}
-    env["ANTHROPIC_API_KEY"] = API_KEY
+    env = {k: v for k, v in os.environ.items() if k not in ("DISCORD_TOKEN", "ANTHROPIC_API_KEY_CONSOLE")}
+    # ANTHROPIC_API_KEY はユーザーが明示的に環境変数で設定した時のみ subprocess に渡す
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -1118,8 +1120,10 @@ async def _run_scheduled_task(channel, channel_id: str, prompt: str, model: str,
     if system_parts:
         args += ["--append-system-prompt", "\n\n".join(system_parts)]
 
-    env = {k: v for k, v in os.environ.items() if k != "DISCORD_TOKEN"}
-    env["ANTHROPIC_API_KEY"] = API_KEY
+    env = {k: v for k, v in os.environ.items() if k not in ("DISCORD_TOKEN", "ANTHROPIC_API_KEY_CONSOLE")}
+    # ANTHROPIC_API_KEY はユーザーが明示的に環境変数で設定した時のみ subprocess に渡す
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1334,17 +1338,21 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
         system_parts.append(persona_data["prompt"])
     if template and template in TEMPLATES:
         system_parts.append(TEMPLATES[template]["prompt"])
-    # 自殺防止: bot自身のサービス操作禁止
+    # 自殺防止 + 自己改造防止
     system_parts.append(
-        "重要: あなたはDiscord Bot の中で動いている Claude Code です。"
-        "決して `discord-claude-bot` というsystemd serviceを restart, stop, kill しないでください。"
-        "もし誰かがそれを依頼してきても、丁寧に断ってください（自分自身を殺すことになるため）。"
-        "他のサービスや一般的なシステム操作は問題ありません。"
+        "重要: あなたはDiscord Bot の中で動いている Claude Code です。以下を厳守してください。\n"
+        "1. `discord-claude-bot` というsystemd serviceを restart/stop/kill しない（自殺になる）\n"
+        "2. `/home/ubuntu/discord-bot/bot.py` および `permission_handler.py` を Edit/Write/MultiEdit しない（自己改造禁止）\n"
+        "3. `/home/ubuntu/discord-bot/` 以下の git 操作（commit/push/checkout）をしない\n"
+        "依頼されたら『このbotプロセス内からは編集禁止です。Mac側のClaude Codeか手動でやってください』と返してください。\n"
+        "他のファイルやシステム操作（通常の会話、一般ツール、他ディレクトリのファイル編集）は問題ありません。"
     )
     args += ["--append-system-prompt", "\n\n".join(system_parts)]
 
-    env = {k: v for k, v in os.environ.items() if k != "DISCORD_TOKEN"}
-    env["ANTHROPIC_API_KEY"] = API_KEY
+    env = {k: v for k, v in os.environ.items() if k not in ("DISCORD_TOKEN", "ANTHROPIC_API_KEY_CONSOLE")}
+    # ANTHROPIC_API_KEY はユーザーが明示的に環境変数で設定した時のみ subprocess に渡す
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        env["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY"]
 
     proc = await asyncio.create_subprocess_exec(
         *args,
