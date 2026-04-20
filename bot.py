@@ -1265,29 +1265,31 @@ async def run_claude_sdk(prompt: str, channel_id: str, attachment_texts: list[st
 
     log_interaction(channel_id, prompt, result_text, model, persona)
 
-    status = get_status_line(channel_id)
     chunks = split_message(result_text)
-    final_first = chunks[0] + (f"\n\n{status}" if len(chunks) == 1 else "")
-    if len(final_first) > 2000:
-        final_first = final_first[:1990] + "…"
     try:
-        await progress_msg.edit(content=final_first)
+        await progress_msg.edit(content=chunks[0][:2000])
     except discord.HTTPException:
-        await message.channel.send(final_first[:2000])
+        await message.channel.send(chunks[0][:2000])
 
-    for i, chunk in enumerate(chunks[1:], start=1):
-        is_last = (i == len(chunks) - 1)
-        text = chunk + (f"\n\n{status}" if is_last else "")
-        await message.channel.send(text[:2000])
+    for chunk in chunks[1:]:
+        await message.channel.send(chunk[:2000])
 
     # 完了通知
     try:
         await message.channel.send(
             f"✅ {message.author.mention} 完了しました。",
-            allowed_mentions=discord.AllowedMentions(users=[message.author])
+            allowed_mentions=discord.AllowedMentions(users=[message.author]),
+            view=ResponseControlView(channel_id),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ 完了通知エラー(sdk): {e}")
+        try:
+            await message.channel.send(
+                f"✅ {message.author.mention} 完了しました。",
+                allowed_mentions=discord.AllowedMentions(users=[message.author]),
+            )
+        except Exception:
+            pass
 
     return result_text, str(work_dir)
 
@@ -1448,31 +1450,32 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
     log_interaction(channel_id, prompt, result_text, model, persona)
 
     # 進捗メッセージを最終結果で置き換え（1チャンク目）
-    status = get_status_line(channel_id)
     chunks = split_message(result_text)
-    final_first = chunks[0] + (f"\n\n{status}" if len(chunks) == 1 else "")
-    if len(final_first) > 2000:
-        final_first = final_first[:1990] + "…"
     try:
-        await progress_msg.edit(content=final_first)
+        await progress_msg.edit(content=chunks[0][:2000])
     except discord.HTTPException:
-        # 編集できなかったら新規送信
-        await message.channel.send(final_first[:2000])
+        await message.channel.send(chunks[0][:2000])
 
     # 残りのチャンク
-    for i, chunk in enumerate(chunks[1:], start=1):
-        is_last = (i == len(chunks) - 1)
-        text = chunk + (f"\n\n{status}" if is_last else "")
-        await message.channel.send(text[:2000])
+    for chunk in chunks[1:]:
+        await message.channel.send(chunk[:2000])
 
     # 完了通知 (ユーザーをpingして気づかせる)
     try:
         await message.channel.send(
             f"✅ {message.author.mention} 完了しました。",
-            allowed_mentions=discord.AllowedMentions(users=[message.author])
+            allowed_mentions=discord.AllowedMentions(users=[message.author]),
+            view=ResponseControlView(channel_id),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ 完了通知エラー(cli): {e}")
+        try:
+            await message.channel.send(
+                f"✅ {message.author.mention} 完了しました。",
+                allowed_mentions=discord.AllowedMentions(users=[message.author]),
+            )
+        except Exception:
+            pass
 
     return result_text, str(work_dir)
 
@@ -3025,6 +3028,83 @@ def _read_claude_sessions(limit: int = 200) -> list[dict]:
             deduped[key] = s
     result = list(deduped.values())[:limit]
     return result
+
+
+class ResponseControlView(discord.ui.View):
+    """完了通知に添付するモデル・モード切り替えUI（ボタン式セレクトメニュー）"""
+
+    def __init__(self, channel_id: str):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+        self._build()
+
+    def _build(self):
+        row = get_session(self.channel_id)
+        cur_model = row[2] if row and row[2] else DEFAULT_MODEL
+        cur_mode  = get_permission_mode(self.channel_id)
+
+        # Row 0: モデル選択
+        model_options = []
+        for key, emoji in MODEL_EMOJI.items():
+            label = {"opus": "Opus", "sonnet": "Sonnet", "haiku": "Haiku"}[key]
+            model_options.append(discord.SelectOption(
+                label=f"{label}",
+                value=key,
+                emoji=emoji,
+                default=(key == cur_model),
+            ))
+        model_select = discord.ui.Select(
+            placeholder=f"モデル: {cur_model}",
+            options=model_options,
+            row=0,
+            custom_id=f"rcv_model_{self.channel_id}",
+        )
+        model_select.callback = self._model_callback
+        self.add_item(model_select)
+
+        # Row 1: モード選択
+        mode_options = []
+        for mode_key, mode_data in PERMISSION_MODES.items():
+            mode_options.append(discord.SelectOption(
+                label=mode_data["label"],
+                value=mode_key,
+                emoji=mode_data["emoji"],
+                default=(mode_key == cur_mode),
+            ))
+        mode_select = discord.ui.Select(
+            placeholder=f"モード: {PERMISSION_MODES.get(cur_mode, {}).get('label', cur_mode)}",
+            options=mode_options,
+            row=1,
+            custom_id=f"rcv_mode_{self.channel_id}",
+        )
+        mode_select.callback = self._mode_callback
+        self.add_item(mode_select)
+
+    async def _model_callback(self, interaction: discord.Interaction):
+        new_model = interaction.data["values"][0]
+        cid = str(interaction.channel_id)
+        row = get_session(cid)
+        if row:
+            save_session(cid, row[0], row[1], new_model, row[3] if len(row) > 3 else "default")
+        else:
+            save_session(cid, None, str(WORK_DIR), new_model, "default")
+        emoji = MODEL_EMOJI.get(new_model, "🤖")
+        await interaction.response.send_message(
+            f"{emoji} モデルを `{new_model}` に切り替えました。",
+            ephemeral=True,
+        )
+
+    async def _mode_callback(self, interaction: discord.Interaction):
+        new_mode = interaction.data["values"][0]
+        cid = str(interaction.channel_id)
+        set_permission_mode(cid, new_mode)
+        mode_data = PERMISSION_MODES.get(new_mode, {})
+        emoji = mode_data.get("emoji", "🔒")
+        label = mode_data.get("label", new_mode)
+        await interaction.response.send_message(
+            f"{emoji} モードを `{label}` に切り替えました。",
+            ephemeral=True,
+        )
 
 
 class ThreadSelectView(discord.ui.View):
