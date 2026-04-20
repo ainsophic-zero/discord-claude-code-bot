@@ -1340,17 +1340,22 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
         system_parts.append(persona_data["prompt"])
     if template and template in TEMPLATES:
         system_parts.append(TEMPLATES[template]["prompt"])
-    # 自殺防止のみ（bot.pyの編集は許可、ただし衝突回避手順あり）
+    # 協調編集モード + 安全な自己再起動ルール
     system_parts.append(
         "重要: あなたはDiscord Bot の中で動いている Claude Code です。\n"
-        "【必須】`discord-claude-bot` systemd serviceを restart/stop/kill しない（自殺になる）。\n"
-        "systemd reload が必要な変更を bot.py に加えた場合はユーザーに「再起動してください」と伝えるだけにする。\n"
         "\n"
         "【bot.py 編集時の衝突回避ルール】Mac側のClaude Codeが同時に編集してる可能性あり。\n"
-        "1. 編集前に必ず `stat /home/ubuntu/discord-bot/bot.py` で mtime を確認\n"
-        "2. mtime が **直近5分以内** だったら、ユーザーに『Mac側で編集中の可能性があります。続行しますか？』と確認してから編集\n"
-        "3. 編集後は即座に `cd /home/ubuntu/discord-bot && git add bot.py && git commit -m 'feat: ...' && git push` で履歴に残す（Mac側が追従できる）\n"
+        "1. 編集前に必ず `stat /home/ubuntu/discord-bot/bot.py` で mtime 確認\n"
+        "2. mtime が直近5分以内なら、ユーザーに『Mac側で編集中の可能性があります。続行しますか？』と確認してから編集\n"
+        "3. 編集後は即座に git add bot.py && git commit && git push で履歴に残す\n"
         "4. git conflict が出たら無理に解決せず、ユーザーに報告して手動解決を依頼\n"
+        "\n"
+        "【自己再起動ルール】systemd reload が必要なときは再起動可。ただし自殺地獄を避けるため以下を厳守：\n"
+        "1. 再起動前に必ずユーザーへ完了メッセージを送信してから実行（Discord の返信が消える事故防止）\n"
+        "2. 即時 restart は禁止。必ず遅延実行: sudo systemd-run --on-active=5s --unit=bot-selfrestart systemctl restart discord-claude-bot\n"
+        "   （5秒後に別ユニットから実行 → 現在の応答が Discord に届いた後で再起動される）\n"
+        "3. 連続再起動の禁止: 直前の再起動から 2分以内なら restart しない。systemctl show discord-claude-bot -p ActiveEnterTimestamp で最終起動時刻を確認し、120秒以上経過してなければスキップしてその旨ユーザーに返す\n"
+        "4. restart/stop/kill 以外の systemctl コマンド（status, reload, show 等）は自由\n"
         "\n"
         "bot.py 以外の通常作業は自由に行って問題ありません。"
     )
