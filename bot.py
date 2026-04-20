@@ -3043,7 +3043,7 @@ class ResponseControlView(discord.ui.View):
     """完了通知に添付するモデル切り替えプルダウン"""
 
     _MODELS = [
-        ("opus",                      "🟣", "Opus 4.7",   "claude-opus-4-7"),
+        ("opus",                      "🟣", "Opus 4.7 1M", "claude-opus-4-7"),
         ("sonnet",                    "🔵", "Sonnet 4.6", "claude-sonnet-4-6"),
         ("claude-opus-4-6",           "🟣", "Opus 4.6",   "claude-opus-4-6"),
         ("claude-haiku-4-5-20251001", "🟢", "Haiku 4.5",  "claude-haiku-4-5-20251001"),
