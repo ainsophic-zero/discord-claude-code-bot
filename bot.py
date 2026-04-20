@@ -781,15 +781,19 @@ async def detect_model_switch_ai(text: str) -> str | None:
         return None
 
     prompt = (
-        "あなたはAIモデル切り替えの意図を検出する分類器です。\n"
-        "以下3種類のモデルを管理しています:\n"
-        "- opus: 最高性能・重い・遅い（例: 重いやつ/一番賢い/最強/Opus/クロードの上位版）\n"
-        "- sonnet: 標準・バランス（例: 普通/標準/Sonnet/デフォルト）\n"
-        "- haiku: 軽量・高速・安い（例: 軽いやつ/速いの/安いの/Haiku/手軽なの）\n\n"
-        "ルール:\n"
-        "- モデル切り替え要求なら opus / sonnet / haiku のいずれかだけ返す\n"
-        "- モデル切り替えでないなら none だけ返す\n"
-        "- 他の言葉は絶対に返さない\n\n"
+        "あなたはAIモデル切り替えコマンドの検出器です。\n"
+        "ユーザーが今まさに切り替えを命令している時だけ opus/sonnet/haiku を返し、それ以外は全て none を返してください。\n\n"
+        "【切り替え命令の例 → opus/sonnet/haiku】\n"
+        "- opusに切り替えて / Opusにして / 重いやつ使って / 一番賢いのでお願い\n"
+        "- sonnetで / ソネットに戻して / 普通の使って\n"
+        "- haikuに変えて / 軽いので / 速いの使いたい\n\n"
+        "【none を返すケース（重要）】\n"
+        "- 質問: 『Sonnet使える？』『Opus 4.7とは？』『haikuって何？』→ none\n"
+        "- 列挙・説明: 『OpusとSonnetとHaikuがある』『Opus 4.7 と Sonnet 4.6 と Haiku 4.5だよ』→ none\n"
+        "- モデル以外の話題でモデル名が偶然出る → none\n"
+        "- クリック/選択/ボタンについての質問: 『それ選んだら切り替わる？』『ボタン押したらどうなる？』→ none\n"
+        "- 過去形の報告: 『さっきsonnetにした』→ none\n\n"
+        "出力は必ず opus / sonnet / haiku / none のいずれか1語のみ。\n\n"
         f"メッセージ: {text}"
     )
     url = (
@@ -3043,10 +3047,10 @@ class ResponseControlView(discord.ui.View):
     """完了通知に添付するモデル切り替えプルダウン"""
 
     _MODELS = [
-        ("opus",                      "🟣", "Opus 4.7 1M", "claude-opus-4-7"),
-        ("sonnet",                    "🔵", "Sonnet 4.6", "claude-sonnet-4-6"),
-        ("claude-opus-4-6",           "🟣", "Opus 4.6",   "claude-opus-4-6"),
-        ("claude-haiku-4-5-20251001", "🟢", "Haiku 4.5",  "claude-haiku-4-5-20251001"),
+        ("claude-opus-4-7",           "🟣", "Opus 4.7",    "claude-opus-4-7"),
+        ("opus",                      "🟣", "Opus 4.7 1M", "claude-opus-4-7"),  # 1Mはbeta header込みの想定
+        ("sonnet",                    "🔵", "Sonnet 4.6",  "claude-sonnet-4-6"),
+        ("claude-haiku-4-5-20251001", "🟢", "Haiku 4.5",   "claude-haiku-4-5-20251001"),
     ]
 
     def __init__(self, channel_id: str):
