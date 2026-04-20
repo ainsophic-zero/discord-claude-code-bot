@@ -3744,6 +3744,97 @@ async def slash_novel(interaction: discord.Interaction, chapter: int):
     )
 
 
+@bot.tree.command(name="novel_model", description="ローカルLLMのモデルを切替 (Qwen/Swallow/Gemma 等)")
+@app_commands.describe(name="モデル名 (例: qwen3.6, swallow32, gemma4)")
+@app_commands.choices(name=[
+    app_commands.Choice(name="🔵 Qwen 3.6-35B-A3B (MoE・速)", value="qwen3.6"),
+    app_commands.Choice(name="🟠 Qwen3 Swallow 32B (日本語特化)", value="swallow32"),
+    app_commands.Choice(name="🟢 Gemma 4 31B (Google最新)", value="gemma4"),
+    app_commands.Choice(name="❓ 現在のモデル確認", value="status"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def slash_novel_model(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    import asyncio as _a, os as _os
+    val = name.value
+
+    if val == "status":
+        # current.gguf の symlink 先確認
+        p = await _a.create_subprocess_exec(
+            "readlink", "/home/ubuntu/models/current.gguf",
+            stdout=_a.subprocess.PIPE,
+        )
+        out, _ = await p.communicate()
+        current = out.decode().strip() or "(unset)"
+        active = "🟢 起動中" if await _novel_llama_ready() else "🔴 停止中"
+        await interaction.response.send_message(
+            f"現在のモデル: `{current}`\n状態: {active}",
+            ephemeral=True,
+        )
+        return
+
+    # モデルファイル自動検出
+    model_map = {
+        "qwen3.6": ["Qwen_Qwen3.6-35B-A3B"],
+        "swallow32": ["Qwen3-Swallow-32B", "Qwen3_Swallow_32B", "Swallow_32B", "swallow-32"],
+        "gemma4": ["gemma-4-31b", "Gemma-4-31B", "Gemma_4_31B", "gemma4-31b"],
+    }
+    patterns = model_map.get(val, [])
+    models_dir = "/home/ubuntu/models"
+    target_file = None
+    for f in _os.listdir(models_dir):
+        if f.endswith(".gguf") and not f.startswith("current"):
+            for pat in patterns:
+                if pat.lower() in f.lower():
+                    target_file = f
+                    break
+            if target_file:
+                break
+
+    if not target_file:
+        await interaction.response.send_message(
+            f"❌ `{val}` に対応する .gguf が `{models_dir}` に見つかりません。\n"
+            f"ダウンロード待ちかも（`ls {models_dir}` で確認）。",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    await interaction.followup.send(f"🔄 モデル切替中: **{target_file}**")
+
+    # 1. llama-server 停止
+    p = await _a.create_subprocess_exec("sudo", "systemctl", "stop", "llama-server")
+    await p.wait()
+    await _a.sleep(2)
+
+    # 2. symlink 差し替え
+    p = await _a.create_subprocess_exec(
+        "ln", "-sf", target_file, "/home/ubuntu/models/current.gguf",
+    )
+    await p.wait()
+
+    # 3. 起動（モデルロード待ち最大3分）
+    p = await _a.create_subprocess_exec("sudo", "systemctl", "start", "llama-server")
+    await p.wait()
+    loaded = False
+    for _ in range(36):
+        await _a.sleep(5)
+        if await _novel_llama_ready():
+            loaded = True
+            break
+
+    if loaded:
+        await interaction.followup.send(
+            f"✅ 切替完了: **{target_file}**\n"
+            f"以降 `/novel` はこのモデルで実行されます。"
+        )
+    else:
+        await interaction.followup.send(
+            f"⚠️ llama-server が3分以内に起動しませんでした。\n"
+            f"`systemctl status llama-server` で確認してください。"
+        )
+
+
 @bot.tree.command(name="novel_llama_stop", description="llama-server を停止してメモリ解放")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
