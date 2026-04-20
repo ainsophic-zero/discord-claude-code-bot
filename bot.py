@@ -447,6 +447,14 @@ def save_template(channel_id: str, template: str | None):
 
 def save_session(channel_id: str, session_id: str, work_dir: str,
                   model: str = DEFAULT_MODEL, persona: str | None = None):
+    # VPS で作成された session jsonl は Mac-encoded dir にも hardlink して
+    # Mac の Claude Code UI 側で時系列表示されるように
+    try:
+        if session_id and work_dir:
+            _mirror_session_to_mac(session_id, work_dir)
+    except Exception:
+        pass
+
     conn = sqlite3.connect(DB_PATH)
     if persona is None:
         # 既存のpersonaを維持
@@ -1235,6 +1243,15 @@ async def run_claude_sdk(prompt: str, channel_id: str, attachment_texts: list[st
         text = chunk + (f"\n\n{status}" if is_last else "")
         await message.channel.send(text[:2000])
 
+    # 完了通知
+    try:
+        await message.channel.send(
+            f"✅ {message.author.mention} 完了しました。",
+            allowed_mentions=discord.AllowedMentions(users=[message.author])
+        )
+    except Exception:
+        pass
+
     return result_text, str(work_dir)
 
 
@@ -1395,6 +1412,15 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
         is_last = (i == len(chunks) - 1)
         text = chunk + (f"\n\n{status}" if is_last else "")
         await message.channel.send(text[:2000])
+
+    # 完了通知 (ユーザーをpingして気づかせる)
+    try:
+        await message.channel.send(
+            f"✅ {message.author.mention} 完了しました。",
+            allowed_mentions=discord.AllowedMentions(users=[message.author])
+        )
+    except Exception:
+        pass
 
     return result_text, str(work_dir)
 
@@ -2723,6 +2749,91 @@ def _mac_to_vps_path(mac_path: str) -> str:
         return _VPS_PATH_PREFIX + mac_path[len(_MAC_PATH_PREFIX):]
     return mac_path
 
+def _vps_cwd_to_mac_cwd(vps_cwd: str) -> str:
+    """VPS の cwd を Mac の同等パスに変換 (bind mount workspaces → .vscode 含む)"""
+    mac = vps_cwd
+    if mac.startswith("/home/ubuntu/"):
+        mac = "/Users/nk/" + mac[len("/home/ubuntu/"):]
+    # bind mount: workspaces → .vscode
+    mac = mac.replace("/dev/vscode-mcp/workspaces/", "/dev/vscode-mcp/.vscode/", 1)
+    if mac.endswith("/dev/vscode-mcp/workspaces"):
+        mac = mac[:-len("workspaces")] + ".vscode"
+    return mac
+
+def _encode_claude_path(p: str) -> str:
+    """Claude Code流: スラッシュをダッシュに"""
+    return p.replace("/", "-")
+
+def _mirror_session_to_mac(session_id: str, vps_work_dir: str) -> bool:
+    """VPS-encoded dir のセッションjsonlを Mac-encoded dir にも hardlink。
+    Mac の Claude Code UI 側で時系列表示されるように。"""
+    import os
+    if not session_id or not vps_work_dir:
+        return False
+    mac_work_dir = _vps_cwd_to_mac_cwd(vps_work_dir)
+    if mac_work_dir == vps_work_dir:
+        return False  # 変換不要 = mirror 不要
+
+    projects = os.path.expanduser("~/.claude/projects")
+    vps_enc = _encode_claude_path(vps_work_dir)
+    mac_enc = _encode_claude_path(mac_work_dir)
+
+    src = os.path.join(projects, vps_enc, f"{session_id}.jsonl")
+    dst_dir = os.path.join(projects, mac_enc)
+    dst = os.path.join(dst_dir, f"{session_id}.jsonl")
+
+    if not os.path.exists(src):
+        return False
+    if os.path.exists(dst) or os.path.islink(dst):
+        return True
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        os.link(src, dst)
+        return True
+    except OSError:
+        return False
+
+def _bulk_mirror_vps_to_mac() -> int:
+    """既存の全 VPS-encoded セッション JSONL を Mac-encoded dir にも hardlink"""
+    import os
+    projects = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(projects):
+        return 0
+    mirrored = 0
+    for entry in os.listdir(projects):
+        if not entry.startswith("-home-ubuntu"):
+            continue
+        full = os.path.join(projects, entry)
+        if not os.path.isdir(full) or os.path.islink(full):
+            continue
+        # entry → vps_path 復元 (-home-ubuntu-... → /home/ubuntu/...)
+        # ただし Claude Code のエンコードは曖昧 (連続dashが混じると不可逆)。
+        # 単純に -home-ubuntu を /home/ubuntu に戻す + 残り dash を / 想定で復元 (限界あり)
+        # 安全策: vps_path を / に戻して mac dir 名を計算しなおすのは難しいので、entry 自体を文字列置換する
+        mac_entry = "-Users-nk" + entry[len("-home-ubuntu"):]
+        # bind mount: workspaces → .vscode (encoded: -workspaces- → --vscode-)
+        if "-workspaces-" in mac_entry:
+            mac_entry = mac_entry.replace("-workspaces-", "--vscode-", 1)
+        elif mac_entry.endswith("-workspaces"):
+            mac_entry = mac_entry[:-len("-workspaces")] + "--vscode"
+        mac_full = os.path.join(projects, mac_entry)
+        os.makedirs(mac_full, exist_ok=True)
+        for f in os.listdir(full):
+            if not f.endswith(".jsonl"):
+                continue
+            src = os.path.join(full, f)
+            dst = os.path.join(mac_full, f)
+            if os.path.exists(dst) or os.path.islink(dst):
+                continue
+            if os.path.isdir(src):
+                continue
+            try:
+                os.link(src, dst)
+                mirrored += 1
+            except OSError:
+                pass
+    return mirrored
+
 def _ensure_vps_session_jsonl(session_id: str, mac_cwd: str) -> bool:
     """Mac側で作成された session jsonl を VPS-encoded project dir に hardlink。
     Claude Code --resume が VPS の cwd encoded dir からセッションを探すため必要。
@@ -2772,7 +2883,7 @@ def _ensure_vps_session_jsonl(session_id: str, mac_cwd: str) -> bool:
             pass
     return linked
 
-def _read_claude_sessions(limit: int = 25) -> list[dict]:
+def _read_claude_sessions(limit: int = 200) -> list[dict]:
     sessions = []
     if not CLAUDE_PROJECTS_DIR.exists():
         return sessions
@@ -2845,20 +2956,31 @@ def _read_claude_sessions(limit: int = 25) -> list[dict]:
 
 
 class ThreadSelectView(discord.ui.View):
-    def __init__(self, sessions: list[dict], channel_id: str):
-        super().__init__(timeout=900)  # 15分
+    PER_PAGE = 25  # Discord StringSelect 上限
+
+    def __init__(self, sessions: list[dict], channel_id: str, page: int = 0):
+        super().__init__(timeout=900)
         self.channel_id = channel_id
+        self.all_sessions = sessions
         self._sessions_map = {s["session_id"]: s for s in sessions}
+        self.page = page
+        self._render()
+
+    def _render(self):
+        self.clear_items()
+        total = len(self.all_sessions)
+        total_pages = max(1, (total + self.PER_PAGE - 1) // self.PER_PAGE)
+        self.page = max(0, min(self.page, total_pages - 1))
+        start = self.page * self.PER_PAGE
+        end = start + self.PER_PAGE
+        page_sessions = self.all_sessions[start:end]
+
         options = []
-        # プロジェクトごとにソート（同じプロジェクトを連続表示）
-        # sessions は既にmtime順でgroupedしてるが、念のためproject keyで安定ソート
-        for s in sessions[:25]:
-            # label は Discord 100文字制限。project と msg を入れる
+        for s in page_sessions:
             proj = s["project"][:30]
             msg = s["first_msg"][:60]
             label = f"[{proj}] {msg}"[:100]
-            # description は project を強調表示（dropdown内で一目でグループがわかる）
-            ts = s.get("timestamp", "")[:19]  # "2026-04-20T04:12:34" 程度
+            ts = s.get("timestamp", "")[:19]
             desc = f"📁 {s['project']}  ·  {ts}"[:100]
             options.append(discord.SelectOption(
                 label=label,
@@ -2866,14 +2988,60 @@ class ThreadSelectView(discord.ui.View):
                 description=desc,
                 emoji="📁",
             ))
+        if not options:
+            options = [discord.SelectOption(label="(空)", value="__empty__")]
+        placeholder = f"セッション選択… ({self.page + 1}/{total_pages}ページ・全{total}件)"
         sel = discord.ui.Select(
-            placeholder="引き継ぐセッションを選択…（先頭の [ ] がプロジェクト）",
+            placeholder=placeholder[:150],
             options=options,
             min_values=1,
             max_values=1,
         )
         sel.callback = self.on_select
         self.add_item(sel)
+
+        # ページネーション ボタン (Selectが1行目、ボタンが2行目)
+        prev_btn = discord.ui.Button(
+            label="◀ 前のページ",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page == 0),
+            row=1,
+        )
+        prev_btn.callback = self.on_prev
+        self.add_item(prev_btn)
+
+        page_label = discord.ui.Button(
+            label=f"📄 {self.page + 1}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+            row=1,
+        )
+        self.add_item(page_label)
+
+        next_btn = discord.ui.Button(
+            label="次のページ ▶",
+            style=discord.ButtonStyle.secondary,
+            disabled=(self.page >= total_pages - 1),
+            row=1,
+        )
+        next_btn.callback = self.on_next
+        self.add_item(next_btn)
+
+    async def on_prev(self, interaction: discord.Interaction):
+        self.page -= 1
+        self._render()
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            await interaction.response.defer()
+
+    async def on_next(self, interaction: discord.Interaction):
+        self.page += 1
+        self._render()
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            await interaction.response.defer()
 
     async def on_select(self, interaction: discord.Interaction):
         selected_id = interaction.data["values"][0]
@@ -3282,7 +3450,7 @@ async def slash_recent(interaction: discord.Interaction, messages: int = 10):
 async def slash_threads(interaction: discord.Interaction):
     cid = str(interaction.channel_id)
     await interaction.response.defer()
-    sessions = _read_claude_sessions(limit=25)
+    sessions = _read_claude_sessions(limit=200)
     if not sessions:
         await interaction.followup.send(
             "📭 セッションが見つかりません。\n"
@@ -3438,6 +3606,13 @@ async def on_ready():
         print(f"⚡ Slash commands synced: {len(synced)} (DM対応有効)")
     except Exception as e:
         print(f"⚠️ Slash sync failed: {e}")
+    # VPS-encoded session jsonl を Mac-encoded dir にも hardlink して
+    # Mac の Claude Code UI 側でも時系列表示されるように
+    try:
+        n = _bulk_mirror_vps_to_mac()
+        print(f"🔗 Mac-mirror hardlinks: {n} created")
+    except Exception as e:
+        print(f"⚠️ bulk mirror failed: {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
