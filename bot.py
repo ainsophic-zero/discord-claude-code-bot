@@ -348,6 +348,13 @@ TEMPLATE_ALIASES = {
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS auto_respond (
+            channel_id TEXT PRIMARY KEY,
+            enabled INTEGER DEFAULT 1,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             channel_id  TEXT PRIMARY KEY,
             session_id  TEXT,
@@ -424,6 +431,22 @@ def get_session(channel_id: str):
     ).fetchone()
     conn.close()
     return row
+
+def is_auto_respond(channel_id: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT enabled FROM auto_respond WHERE channel_id=?", (channel_id,)).fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+def set_auto_respond(channel_id: str, enabled: bool):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO auto_respond(channel_id, enabled) VALUES(?,?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP",
+        (channel_id, 1 if enabled else 0)
+    )
+    conn.commit()
+    conn.close()
 
 def save_thread_title(channel_id: str, title: str | None):
     conn = sqlite3.connect(DB_PATH)
@@ -1311,8 +1334,14 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
         system_parts.append(persona_data["prompt"])
     if template and template in TEMPLATES:
         system_parts.append(TEMPLATES[template]["prompt"])
-    if system_parts:
-        args += ["--append-system-prompt", "\n\n".join(system_parts)]
+    # 自殺防止: bot自身のサービス操作禁止
+    system_parts.append(
+        "重要: あなたはDiscord Bot の中で動いている Claude Code です。"
+        "決して `discord-claude-bot` というsystemd serviceを restart, stop, kill しないでください。"
+        "もし誰かがそれを依頼してきても、丁寧に断ってください（自分自身を殺すことになるため）。"
+        "他のサービスや一般的なシステム操作は問題ありません。"
+    )
+    args += ["--append-system-prompt", "\n\n".join(system_parts)]
 
     env = {k: v for k, v in os.environ.items() if k != "DISCORD_TOKEN"}
     env["ANTHROPIC_API_KEY"] = API_KEY
@@ -3302,6 +3331,33 @@ async def slash_thread(interaction: discord.Interaction, name: str, prompt: str 
     await interaction.followup.send(f"✅ スレッド作成: {thread.mention}")
 
 
+@bot.tree.command(name="auto_respond", description="このチャンネルでメンション無しでも自動応答するか切替")
+@app_commands.describe(mode="on=有効, off=無効, status=現在の状態")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="✅ ON (メンション不要)", value="on"),
+    app_commands.Choice(name="🔕 OFF (メンション必須)", value="off"),
+    app_commands.Choice(name="❓ 状態確認", value="status"),
+])
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def slash_auto_respond(interaction: discord.Interaction, mode: str = "status"):
+    cid = str(interaction.channel_id)
+    if mode == "status":
+        cur = is_auto_respond(cid)
+        await interaction.response.send_message(
+            f"このチャンネルの auto-respond: **{'✅ ON' if cur else '🔕 OFF'}**\n"
+            f"切替: `/auto_respond on` または `/auto_respond off`",
+            ephemeral=True,
+        )
+        return
+    enable = (mode == "on")
+    set_auto_respond(cid, enable)
+    await interaction.response.send_message(
+        f"{'✅ メンション無しで自動応答するようになりました。' if enable else '🔕 メンション必須に戻しました。'}\n"
+        f"全てのメッセージ（bot自身は除く）に反応します。" if enable else ""
+    )
+
+
 @bot.tree.command(name="threads_recent", description="過去N時間以内に更新があったセッションだけ表示")
 @app_commands.describe(hours="何時間前まで遡るか（デフォルト1）")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -3517,18 +3573,7 @@ async def slash_threads(interaction: discord.Interaction):
             lines.append(f"{prefix} `{counter:>3}` 🧵 {s["first_msg"]}")
             counter += 1
 
-    # Discord 1メッセージ 2000字制限で分割
-    chunks = []
-    current = ""
-    for line in lines:
-        if len(current) + len(line) + 1 > 1900:
-            chunks.append(current)
-            current = line
-        else:
-            current = (current + "\n" + line) if current else line
-    if current:
-        chunks.append(current)
-    for chunk in chunks:
+    for chunk in split_message("\n".join(lines)):
         await interaction.followup.send(chunk)
 
 
@@ -3655,8 +3700,9 @@ async def on_message(message: discord.Message):
 
     is_dm      = isinstance(message.channel, discord.DMChannel)
     is_mention = bot.user in message.mentions
+    is_auto    = is_auto_respond(str(message.channel.id))
 
-    if not (is_dm or is_mention):
+    if not (is_dm or is_mention or is_auto):
         return
 
     # @mention部分を除去
