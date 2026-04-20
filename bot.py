@@ -1275,9 +1275,10 @@ async def run_claude_sdk(prompt: str, channel_id: str, attachment_texts: list[st
         await message.channel.send(chunk[:2000])
 
     # 完了通知
+    status = get_status_line(channel_id)
     try:
         await message.channel.send(
-            f"✅ {message.author.mention} 完了しました。",
+            f"{status}\n✅ {message.author.mention} 完了しました。",
             allowed_mentions=discord.AllowedMentions(users=[message.author]),
             view=ResponseControlView(channel_id),
         )
@@ -1466,9 +1467,10 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
         await message.channel.send(chunk[:2000])
 
     # 完了通知 (ユーザーをpingして気づかせる)
+    status = get_status_line(channel_id)
     try:
         await message.channel.send(
-            f"✅ {message.author.mention} 完了しました。",
+            f"{status}\n✅ {message.author.mention} 完了しました。",
             allowed_mentions=discord.AllowedMentions(users=[message.author]),
             view=ResponseControlView(channel_id),
         )
@@ -1516,7 +1518,7 @@ def get_status_line(channel_id: str) -> str:
     perm_emoji = perm_v.get("emoji", "🔒")
     perm_label = perm_v.get("label", perm_mode)
     thread_part = f" / 🧵 `{thread_title}`" if thread_title else " / 🧵 `(新規)`"
-    return f"-# 📁 `{project}`{thread_part}  ｜  {m_emoji} `{model}`  ｜  {perm_emoji} `{perm_label}`{p_part}{t_part}"
+    return f"-# 📁 `{project}`{thread_part}  ｜  {perm_emoji} `{perm_label}`{p_part}{t_part}"
 
 async def update_channel_topic(channel: discord.abc.Messageable, channel_id: str):
     """チャンネルトピックに現在のプロジェクト・スレッド・モデル・モードを表示。"""
@@ -3038,6 +3040,13 @@ def _read_claude_sessions(limit: int = 200) -> list[dict]:
 class ResponseControlView(discord.ui.View):
     """完了通知に添付するモデル切り替えプルダウン"""
 
+    _MODELS = [
+        ("opus",                      "🟣", "Opus 4.7",   "claude-opus-4-7"),
+        ("sonnet",                    "🔵", "Sonnet 4.6", "claude-sonnet-4-6"),
+        ("claude-opus-4-6",           "🟣", "Opus 4.6",   "claude-opus-4-6"),
+        ("claude-haiku-4-5-20251001", "🟢", "Haiku 4.5",  "claude-haiku-4-5-20251001"),
+    ]
+
     def __init__(self, channel_id: str):
         super().__init__(timeout=None)
         self.channel_id = channel_id
@@ -3045,12 +3054,12 @@ class ResponseControlView(discord.ui.View):
         cur_model = row[2] if row and row[2] else DEFAULT_MODEL
 
         options = [
-            discord.SelectOption(label="Opus",   value="opus",   emoji="🟣", default=(cur_model == "opus")),
-            discord.SelectOption(label="Sonnet", value="sonnet", emoji="🔵", default=(cur_model == "sonnet")),
-            discord.SelectOption(label="Haiku",  value="haiku",  emoji="🟢", default=(cur_model == "haiku")),
+            discord.SelectOption(label=label, value=value, emoji=emoji,
+                                 default=(cur_model in (value, model_id)))
+            for value, emoji, label, model_id in self._MODELS
         ]
         select = discord.ui.Select(
-            placeholder=f"モデル: {cur_model}",
+            placeholder="モデルを切り替え",
             options=options,
             row=0,
             custom_id=f"rcv_model_{channel_id}",
@@ -3066,9 +3075,10 @@ class ResponseControlView(discord.ui.View):
             save_session(cid, row[0], row[1], new_model, row[3] if len(row) > 3 else "default")
         else:
             save_session(cid, None, str(WORK_DIR), new_model, "default")
-        emoji = MODEL_EMOJI.get(new_model, "🤖")
+        label = next((l for v, _, l, _ in self._MODELS if v == new_model), new_model)
+        emoji = next((e for v, e, _, _ in self._MODELS if v == new_model), "🤖")
         await interaction.response.send_message(
-            f"{emoji} モデルを `{new_model}` に切り替えました。", ephemeral=True)
+            f"{emoji} モデルを **{label}** に切り替えました。", ephemeral=True)
 
 
 class ThreadSelectView(discord.ui.View):
