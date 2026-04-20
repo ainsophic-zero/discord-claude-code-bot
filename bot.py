@@ -3036,69 +3036,39 @@ def _read_claude_sessions(limit: int = 200) -> list[dict]:
 
 
 class ResponseControlView(discord.ui.View):
-    """完了通知に添付するモデル・モード切り替えUI（ボタン横並び）"""
-
-    _MODEL_BUTTONS = [
-        ("opus",   "🟣", "Opus"),
-        ("sonnet", "🔵", "Sonnet"),
-        ("haiku",  "🟢", "Haiku"),
-    ]
-    _MODE_BUTTONS = [
-        ("bypassPermissions", "⚠️", "危険"),
-        ("auto",              "🤖", "オート"),
-        ("acceptEdits",       "✏️", "編集"),
-        ("default",           "🔐", "毎回"),
-        ("plan",              "🧐", "計画"),
-    ]
+    """完了通知に添付するモデル切り替えプルダウン"""
 
     def __init__(self, channel_id: str):
         super().__init__(timeout=None)
         self.channel_id = channel_id
-        self._build()
-
-    def _build(self):
-        row = get_session(self.channel_id)
+        row = get_session(channel_id)
         cur_model = row[2] if row and row[2] else DEFAULT_MODEL
-        cur_mode  = get_permission_mode(self.channel_id)
 
-        # Row 0: モデルボタン
-        for value, emoji, label in self._MODEL_BUTTONS:
-            style = discord.ButtonStyle.primary if value == cur_model else discord.ButtonStyle.secondary
-            btn = discord.ui.Button(label=label, emoji=emoji, style=style, row=0,
-                                    custom_id=f"rcv_m_{self.channel_id}_{value}")
-            btn.callback = self._make_model_cb(value)
-            self.add_item(btn)
+        options = [
+            discord.SelectOption(label="Opus",   value="opus",   emoji="🟣", default=(cur_model == "opus")),
+            discord.SelectOption(label="Sonnet", value="sonnet", emoji="🔵", default=(cur_model == "sonnet")),
+            discord.SelectOption(label="Haiku",  value="haiku",  emoji="🟢", default=(cur_model == "haiku")),
+        ]
+        select = discord.ui.Select(
+            placeholder=f"モデル: {cur_model}",
+            options=options,
+            row=0,
+            custom_id=f"rcv_model_{channel_id}",
+        )
+        select.callback = self._model_callback
+        self.add_item(select)
 
-        # Row 1: モードボタン
-        for value, emoji, label in self._MODE_BUTTONS:
-            style = discord.ButtonStyle.primary if value == cur_mode else discord.ButtonStyle.secondary
-            btn = discord.ui.Button(label=label, emoji=emoji, style=style, row=1,
-                                    custom_id=f"rcv_p_{self.channel_id}_{value}")
-            btn.callback = self._make_mode_cb(value)
-            self.add_item(btn)
-
-    def _make_model_cb(self, model_value: str):
-        async def callback(interaction: discord.Interaction):
-            cid = str(interaction.channel_id)
-            row = get_session(cid)
-            if row:
-                save_session(cid, row[0], row[1], model_value, row[3] if len(row) > 3 else "default")
-            else:
-                save_session(cid, None, str(WORK_DIR), model_value, "default")
-            emoji = MODEL_EMOJI.get(model_value, "🤖")
-            await interaction.response.send_message(
-                f"{emoji} モデルを `{model_value}` に切り替えました。", ephemeral=True)
-        return callback
-
-    def _make_mode_cb(self, mode_value: str):
-        async def callback(interaction: discord.Interaction):
-            cid = str(interaction.channel_id)
-            set_permission_mode(cid, mode_value)
-            mode_data = PERMISSION_MODES.get(mode_value, {})
-            await interaction.response.send_message(
-                f"{mode_data.get('emoji','🔒')} モードを `{mode_data.get('label', mode_value)}` に切り替えました。",
-                ephemeral=True)
-        return callback
+    async def _model_callback(self, interaction: discord.Interaction):
+        new_model = interaction.data["values"][0]
+        cid = str(interaction.channel_id)
+        row = get_session(cid)
+        if row:
+            save_session(cid, row[0], row[1], new_model, row[3] if len(row) > 3 else "default")
+        else:
+            save_session(cid, None, str(WORK_DIR), new_model, "default")
+        emoji = MODEL_EMOJI.get(new_model, "🤖")
+        await interaction.response.send_message(
+            f"{emoji} モデルを `{new_model}` に切り替えました。", ephemeral=True)
 
 
 class ThreadSelectView(discord.ui.View):
