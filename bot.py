@@ -20,6 +20,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from permission_handler import DiscordPermissionUI, make_pretool_hook
+
+# /novel 用: シンクロニシティサーキット執筆環境
+NOVEL_BIBLE_DIR = Path("/home/ubuntu/obsidian/シンクロニシティサーキット/bible")
+NOVEL_CHAPTERS_DIR = Path("/home/ubuntu/obsidian/シンクロニシティサーキット/chapters")
+NOVEL_STATE_DIR = Path("/home/ubuntu/obsidian/シンクロニシティサーキット/state")
+LLAMA_URL = "http://127.0.0.1:8090/v1/chat/completions"
+LLAMA_HEALTH = "http://127.0.0.1:8090/health"
 try:
     from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher
     SDK_AVAILABLE = True
@@ -3605,6 +3612,152 @@ async def slash_recent(interaction: discord.Interaction, messages: int = 10):
     )
 
 
+@bot.tree.command(name="novel", description="小説の章を書かせる（シンクロニシティサーキット）")
+@app_commands.describe(chapter="第何章？ (2〜14 の数字、または 0=序章)")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def slash_novel(interaction: discord.Interaction, chapter: int):
+    if chapter < 0 or chapter > 14:
+        await interaction.response.send_message("❌ chapter は 0〜14 で指定", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # llama-server 起動確認
+    await interaction.followup.send("🔌 llama-server 確認中…")
+    if not await _novel_start_llama():
+        await interaction.followup.send("❌ llama-server が起動できませんでした。")
+        return
+
+    # bible 読み込み（チャプター抽出含む）
+    await interaction.followup.send(f"📚 第{chapter}章の資料を読み込み中…")
+    try:
+        voice = (NOVEL_BIBLE_DIR / "ノア口調ガイドライン.md").read_text(encoding="utf-8")
+        structure = (NOVEL_BIBLE_DIR / "最終章立て.md").read_text(encoding="utf-8")
+        outline_a = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントA_日常・整合性.md").read_text(encoding="utf-8"),
+            chapter
+        )
+        outline_b = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントB_対話・論理.md").read_text(encoding="utf-8"),
+            chapter
+        )
+        outline_c = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントC_感情・伏線.md").read_text(encoding="utf-8"),
+            chapter
+        )
+        writer_prompt = (NOVEL_BIBLE_DIR / "agents" / "writer.md").read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        await interaction.followup.send(f"❌ 必要なファイルがない: {e}")
+        return
+
+    # 前章末の繋がり（あれば）
+    prev_tail = ""
+    if chapter >= 2:
+        pub_dir = NOVEL_CHAPTERS_DIR / "published"
+        for f in sorted(pub_dir.glob(f"*第{chapter-1}章*.md")):
+            content = f.read_text(encoding="utf-8")
+            prev_tail = content[-1000:]  # 末尾1000字
+            break
+
+    user_prompt = f"""【執筆依頼】第{chapter}章の本文を書いてください。
+
+# ノア口調ガイドライン（必ず遵守）
+{voice}
+
+# 最終章立て（全体構成の位置づけ確認用）
+{structure}
+
+# この章の概要（エージェントA：日常・整合性視点）
+{outline_a}
+
+# この章の概要（エージェントB：対話・論理視点）
+{outline_b}
+
+# この章の概要（エージェントC：感情・伏線視点）
+{outline_c}
+
+{"# 前章の結末（繋ぎ確認用）" + chr(10) + prev_tail if prev_tail else ""}
+
+---
+
+上の A/B/C 3視点の概要を **融合して** 1章分の本文を書いてください。
+出力フォーマット：
+
+# 第{chapter}章 [章タイトル]
+
+## 冒頭シーン
+（ユウの日常描写）
+
+## カフェシーン
+（ノア×ユウの対話、本編）
+
+## 一撃フレーズ
+> （スクショで共有したくなる一文）
+
+## 実践ワーク
+（該当章のワーク）
+
+## 章末の引き
+（次章への問い）
+
+本文のみで、メタコメントや説明は一切不要です。"""
+
+    await interaction.followup.send(f"✍️ ライター（Qwen 3.6）が執筆中… (3〜5分)")
+
+    try:
+        draft = await _novel_call_llama(
+            system_prompt=writer_prompt,
+            user_prompt=user_prompt,
+            max_tokens=10000,
+            temperature=0.85,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ 執筆中にエラー: {e}")
+        return
+
+    # 保存
+    drafts_dir = NOVEL_CHAPTERS_DIR / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    # 既存 v* をチェックして版数決定
+    existing = list(drafts_dir.glob(f"第{chapter}章_本文_v*.md"))
+    v = len(existing) + 1
+    out_path = drafts_dir / f"第{chapter}章_本文_v{v}.md"
+    header = f"""作成日: {__import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")}
+版: v{v}
+書き手: Qwen 3.6-35B-A3B (ローカル)
+
+---
+
+"""
+    out_path.write_text(header + draft, encoding="utf-8")
+
+    # Discord に報告
+    char_count = len(draft)
+    preview = draft[:600]
+    await interaction.followup.send(
+        f"✅ **第{chapter}章 v{v} 完成！**\n"
+        f"📁 `{out_path.name}`\n"
+        f"📊 {char_count}字\n\n"
+        f"**冒頭プレビュー：**\n```\n{preview}...\n```\n"
+        f"続き：`/novel_review {chapter}` でレビュー、`/novel {chapter}` で v{v+1} に改稿"
+    )
+
+
+@bot.tree.command(name="novel_llama_stop", description="llama-server を停止してメモリ解放")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def slash_novel_llama_stop(interaction: discord.Interaction):
+    await interaction.response.defer()
+    import asyncio as _a
+    p = await _a.create_subprocess_exec(
+        "sudo", "systemctl", "stop", "llama-server",
+        stdout=_a.subprocess.PIPE, stderr=_a.subprocess.PIPE,
+    )
+    await p.wait()
+    await interaction.followup.send("🔌 llama-server を停止、メモリを解放しました。")
+
+
 @bot.tree.command(name="threads", description="Mac Claude Codeのセッション一覧から会話を引き継ぎ")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -3739,6 +3892,82 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 await handle_message(orig, "続けて")
             except Exception:
                 await channel.send("⚠️ 元のメッセージが見つかりません。", delete_after=10)
+
+async def _novel_llama_ready() -> bool:
+    """llama-server が生きてるか"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(LLAMA_HEALTH, timeout=aiohttp.ClientTimeout(total=3)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    return d.get("status") == "ok"
+    except Exception:
+        pass
+    return False
+
+
+async def _novel_start_llama() -> bool:
+    """llama-server を起動（必要なら）"""
+    if await _novel_llama_ready():
+        return True
+    import asyncio as _a
+    p = await _a.create_subprocess_exec(
+        "sudo", "systemctl", "start", "llama-server",
+        stdout=_a.subprocess.PIPE, stderr=_a.subprocess.PIPE,
+    )
+    await p.wait()
+    # モデルロード待ち (最大90秒)
+    for _ in range(18):
+        await _a.sleep(5)
+        if await _novel_llama_ready():
+            return True
+    return False
+
+
+def _novel_extract_chapter_section(markdown: str, chapter_num: int) -> str:
+    """outline.md から「第N章」セクションだけ抽出"""
+    import re
+    lines = markdown.split("\n")
+    out = []
+    in_section = False
+    target_pattern = re.compile(rf"^##+\s*第{chapter_num}章")
+    any_chapter_pattern = re.compile(r"^##+\s*(第\d+章|終章|序章)")
+    for line in lines:
+        if target_pattern.match(line):
+            in_section = True
+        elif in_section and any_chapter_pattern.match(line):
+            break  # 次の章始まったら終了
+        if in_section:
+            out.append(line)
+    return "\n".join(out) if out else ""
+
+
+async def _novel_call_llama(system_prompt: str, user_prompt: str,
+                             max_tokens: int = 8000, temperature: float = 0.85) -> str:
+    """llama-server に OpenAI 互換 API で問合せ"""
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": False,
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            LLAMA_URL, json=payload,
+            timeout=aiohttp.ClientTimeout(total=900),
+        ) as r:
+            data = await r.json()
+            if "choices" not in data:
+                return f"⚠️ llama-server error: {data}"
+            content = data["choices"][0]["message"]["content"]
+            # <think></think> タグ除去 (Qwen 3.6 reasoning)
+            import re
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            return content
+
 
 @bot.event
 async def on_ready():
