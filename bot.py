@@ -404,6 +404,7 @@ def init_db():
         "ALTER TABLE sessions ADD COLUMN model TEXT DEFAULT 'claude-sonnet-4-5'",
         "ALTER TABLE sessions ADD COLUMN persona TEXT DEFAULT 'default'",
         "ALTER TABLE sessions ADD COLUMN permission_mode TEXT DEFAULT 'bypassPermissions'",
+        "ALTER TABLE sessions ADD COLUMN thread_title TEXT",
         "ALTER TABLE sessions ADD COLUMN template TEXT DEFAULT NULL",
     ):
         try:
@@ -414,15 +415,24 @@ def init_db():
     conn.close()
 
 def get_session(channel_id: str):
-    """戻り値: (session_id, work_dir, model, persona, template)"""
+    """戻り値: (session_id, work_dir, model, persona, template, thread_title)"""
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT session_id, work_dir, model, COALESCE(persona,'default'), template "
+        "SELECT session_id, work_dir, model, COALESCE(persona,'default'), template, thread_title "
         "FROM sessions WHERE channel_id=?",
         (channel_id,)
     ).fetchone()
     conn.close()
     return row
+
+def save_thread_title(channel_id: str, title: str | None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE sessions SET thread_title=?, updated_at=CURRENT_TIMESTAMP WHERE channel_id=?",
+        (title, channel_id)
+    )
+    conn.commit()
+    conn.close()
 
 def save_template(channel_id: str, template: str | None):
     """テンプレート設定（Noneで解除）"""
@@ -1437,12 +1447,14 @@ DM_ALLOWED  = discord.app_commands.AppCommandContext(guild=True, dm_channel=True
 DM_INSTALLS = discord.app_commands.AppInstallationType(guild=True, user=True)
 
 def get_status_line(channel_id: str) -> str:
-    """現在のプロジェクト・モデル・ペルソナ・テンプレートを1行で返す"""
+    """現在のプロジェクト・スレッド・モデル・モード・ペルソナ・テンプレートを1行で返す"""
     row = get_session(channel_id)
     project  = Path(row[1]).name if row and row[1] else WORK_DIR.name
     model    = row[2] if row and row[2] else DEFAULT_MODEL
     persona  = row[3] if row and len(row) > 3 and row[3] else "default"
     template = row[4] if row and len(row) > 4 and row[4] else None
+    thread_title = row[5] if row and len(row) > 5 and row[5] else None
+    perm_mode = get_permission_mode(channel_id)
     m_emoji  = MODEL_EMOJI.get(model, "🤖")
     p_data   = PERSONAS.get(persona, PERSONAS["default"])
     p_part   = "" if persona == "default" else f"  ｜  {p_data['emoji']} `{p_data['label']}`"
@@ -1450,20 +1462,27 @@ def get_status_line(channel_id: str) -> str:
     if template and template in TEMPLATES:
         t_data = TEMPLATES[template]
         t_part = f"  ｜  {t_data['emoji']} `{t_data['label']}`"
-    return f"-# 📁 `{project}`  ｜  {m_emoji} `{model}`{p_part}{t_part}"
+    perm_v = PERMISSION_MODES.get(perm_mode, {})
+    perm_emoji = perm_v.get("emoji", "🔒")
+    perm_label = perm_v.get("label", perm_mode)
+    thread_part = f" / 🧵 `{thread_title}`" if thread_title else " / 🧵 `(新規)`"
+    return f"-# 📁 `{project}`{thread_part}  ｜  {m_emoji} `{model}`  ｜  {perm_emoji} `{perm_label}`{p_part}{t_part}"
 
 async def update_channel_topic(channel: discord.abc.Messageable, channel_id: str):
-    """チャンネルトピックに現在のプロジェクトとモデルを表示する。
-    DMやスレッドなど topic 非対応チャンネルは無視。
-    Discord のレート制限（2回/10分）はHTTPExceptionで握り潰す。
-    """
+    """チャンネルトピックに現在のプロジェクト・スレッド・モデル・モードを表示。"""
     if not isinstance(channel, discord.TextChannel):
         return
     row = get_session(channel_id)
     project = Path(row[1]).name if row and row[1] else WORK_DIR.name
     model   = row[2] if row and row[2] else DEFAULT_MODEL
     emoji   = MODEL_EMOJI.get(model, "🤖")
-    topic   = f"📁 {project}  ｜  {emoji} {model}"
+    thread_title = row[5] if row and len(row) > 5 and row[5] else None
+    perm_mode = get_permission_mode(channel_id)
+    perm_v = PERMISSION_MODES.get(perm_mode, {})
+    perm_emoji = perm_v.get("emoji", "🔒")
+    thread_part = f" / 🧵{thread_title}" if thread_title else ""
+    topic   = f"📁 {project}{thread_part}  ｜  {emoji} {model}  ｜  {perm_emoji}"
+    topic = topic[:1024]  # Discord topic max
     try:
         await channel.edit(topic=topic)
     except (discord.Forbidden, discord.HTTPException):
@@ -2950,9 +2969,20 @@ def _read_claude_sessions(limit: int = 200) -> list[dict]:
             "timestamp": last_ts or "",
             "cwd": cwd or "",
         })
-        if len(sessions) >= limit:
+        if len(sessions) >= limit * 3:  # over-read for dedup
             break
-    return sessions
+
+    # dedupe: 同じ (project, title) の中で最新のものだけ残す
+    from collections import OrderedDict
+    deduped: dict = OrderedDict()
+    # timestamp 降順でソート（最新が先）
+    sessions_sorted = sorted(sessions, key=lambda s: s.get("timestamp", ""), reverse=True)
+    for s in sessions_sorted:
+        key = (s["project"], s["first_msg"][:120])
+        if key not in deduped:
+            deduped[key] = s
+    result = list(deduped.values())[:limit]
+    return result
 
 
 class ThreadSelectView(discord.ui.View):
@@ -3058,6 +3088,8 @@ class ThreadSelectView(discord.ui.View):
         cur_model   = row[2] if row and len(row) > 2 and row[2] else DEFAULT_MODEL
         cur_persona = row[3] if row and len(row) > 3 and row[3] else "default"
         save_session(self.channel_id, selected_id, vps_cwd, cur_model, cur_persona)
+        # スレッドタイトルを記録（ステータス表示用）
+        save_thread_title(self.channel_id, session.get("first_msg", "")[:120])
         await interaction.response.send_message(
             f"✅ セッション引き継ぎ完了\n"
             f"📁 プロジェクト: `{session['project']}`\n"
@@ -3305,6 +3337,9 @@ async def slash_threads_recent(interaction: discord.Interaction, hours: float = 
         return
 
     view = ThreadSelectView(filtered, cid)
+    summary = f"⏰ **過去{hours}時間のスレッド** {len(filtered)}件\n下のドロップダウンから選択。"
+    await interaction.followup.send(summary, view=view)
+
     from collections import OrderedDict
     grouped: dict[str, list] = OrderedDict()
     for s in filtered:
@@ -3313,7 +3348,7 @@ async def slash_threads_recent(interaction: discord.Interaction, hours: float = 
             grouped[proj] = []
         grouped[proj].append(s)
 
-    lines = [f"⏰ **過去{hours}時間以内のセッション {len(filtered)}件**"]
+    lines = []
     counter = 1
     for proj, items in grouped.items():
         lines.append("")
@@ -3321,7 +3356,7 @@ async def slash_threads_recent(interaction: discord.Interaction, hours: float = 
         for si, s in enumerate(items):
             is_last = (si == len(items) - 1)
             prefix = "  └─" if is_last else "  ├─"
-            lines.append(f"{prefix} `{counter:>2}` {s['first_msg']}")
+            lines.append(f"{prefix} `{counter:>2}` 🧵 {s['first_msg']}")
             counter += 1
 
     chunks = []
@@ -3334,11 +3369,8 @@ async def slash_threads_recent(interaction: discord.Interaction, hours: float = 
             cur = (cur + "\n" + line) if cur else line
     if cur:
         chunks.append(cur)
-    for i, chunk in enumerate(chunks):
-        if i == len(chunks) - 1:
-            await interaction.followup.send(chunk, view=view)
-        else:
-            await interaction.followup.send(chunk)
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
 
 
 @bot.tree.command(name="recent", description="現在のセッションの直近Nメッセージだけを引き継ぐ（履歴リセット）")
@@ -3458,7 +3490,14 @@ async def slash_threads(interaction: discord.Interaction):
         )
         return
     view = ThreadSelectView(sessions, cid)
-    # プロジェクトごとにグループ化（最新セッションを持つプロジェクトが先頭）
+    # 概要 + dropdown を最初のメッセージで送る (常に見える位置)
+    summary = (
+        f"📋 **スレッド一覧**: 全{len(sessions)}件（重複除去済み）\n"
+        f"下のドロップダウンから選択。`◀▶` ボタンでページ移動。"
+    )
+    await interaction.followup.send(summary, view=view)
+
+    # 詳細ツリー表示は補足として続けて送る (任意で読める)
     from collections import OrderedDict
     grouped: dict[str, list] = OrderedDict()
     for s in sessions:
@@ -3467,20 +3506,18 @@ async def slash_threads(interaction: discord.Interaction):
             grouped[proj] = []
         grouped[proj].append(s)
 
-    lines = [f"📋 **{len(sessions)}件のセッション**（番号かタイトルでDropdownから選んで引継ぎ）"]
+    lines = []
     counter = 1
-    total_projects = len(grouped)
-    for pi, (proj, items) in enumerate(grouped.items()):
-        # プロジェクト見出し: 大きめの区切り
+    for proj, items in grouped.items():
         lines.append("")
         lines.append(f"📁 **{proj}**")
-        # ツリー風の各セッション
         for si, s in enumerate(items):
             is_last = (si == len(items) - 1)
             prefix = "  └─" if is_last else "  ├─"
-            lines.append(f"{prefix} `{counter:>2}` {s["first_msg"]}")
+            lines.append(f"{prefix} `{counter:>3}` 🧵 {s["first_msg"]}")
             counter += 1
-    # Discord 1メッセージ 2000字制限。超えたら分割（最後のチャンクに dropdown を添付）
+
+    # Discord 1メッセージ 2000字制限で分割
     chunks = []
     current = ""
     for line in lines:
@@ -3491,11 +3528,8 @@ async def slash_threads(interaction: discord.Interaction):
             current = (current + "\n" + line) if current else line
     if current:
         chunks.append(current)
-    for i, chunk in enumerate(chunks):
-        if i == len(chunks) - 1:
-            await interaction.followup.send(chunk, view=view)
-        else:
-            await interaction.followup.send(chunk)
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
 
 
 # ── リアクション操作 ───────────────────────────────
