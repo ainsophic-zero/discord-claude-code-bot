@@ -1053,6 +1053,7 @@ async def _generate_daily_report(channel, channel_id: str, immediate: bool = Fal
         "--output-format", "stream-json",
         "--input-format", "text",
         "--model", "sonnet",
+        "--effort", "high",
         "--verbose",
         "--dangerously-skip-permissions",
     ]
@@ -1108,6 +1109,7 @@ async def _run_scheduled_task(channel, channel_id: str, prompt: str, model: str,
         "--output-format", "stream-json",
         "--input-format", "text",
         "--model", model,
+        "--effort", "high",
         "--verbose",
         "--dangerously-skip-permissions",
     ]
