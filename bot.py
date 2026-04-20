@@ -3748,7 +3748,7 @@ async def slash_novel(interaction: discord.Interaction, chapter: int):
 @app_commands.describe(name="モデル名 (例: qwen3.6, swallow32, gemma4)")
 @app_commands.choices(name=[
     app_commands.Choice(name="🔵 Qwen 3.6-35B-A3B (MoE・速)", value="qwen3.6"),
-    app_commands.Choice(name="🟠 Qwen3 Swallow 32B (日本語特化)", value="swallow32"),
+    app_commands.Choice(name="🟠 Qwen3 Swallow 30B-A3B (日本語特化 MoE)", value="swallow"),
     app_commands.Choice(name="🟢 Gemma 4 31B (Google最新)", value="gemma4"),
     app_commands.Choice(name="❓ 現在のモデル確認", value="status"),
 ])
@@ -3776,7 +3776,7 @@ async def slash_novel_model(interaction: discord.Interaction, name: app_commands
     # モデルファイル自動検出
     model_map = {
         "qwen3.6": ["Qwen_Qwen3.6-35B-A3B"],
-        "swallow32": ["Qwen3-Swallow-32B", "Qwen3_Swallow_32B", "Swallow_32B", "swallow-32"],
+        "swallow": ["Qwen3-Swallow-30B-A3B", "Qwen3-Swallow", "Swallow-30B"],
         "gemma4": ["gemma-4-31b", "Gemma-4-31B", "Gemma_4_31B", "gemma4-31b"],
     }
     patterns = model_map.get(val, [])
