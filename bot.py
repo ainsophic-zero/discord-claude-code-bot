@@ -3066,11 +3066,15 @@ class ResponseControlView(discord.ui.View):
         row = get_session(channel_id)
         cur_model = row[2] if row and row[2] else DEFAULT_MODEL
 
-        options = [
-            discord.SelectOption(label=label, value=value, emoji=emoji,
-                                 default=(cur_model in (value, model_id)))
-            for value, emoji, label, model_id in self._MODELS
-        ]
+        options = []
+        default_set = False
+        for value, emoji, label, model_id in self._MODELS:
+            is_default = (not default_set) and (cur_model in (value, model_id))
+            if is_default:
+                default_set = True
+            options.append(discord.SelectOption(
+                label=label, value=value, emoji=emoji, default=is_default
+            ))
         select = discord.ui.Select(
             placeholder="モデルを切り替え",
             options=options,
