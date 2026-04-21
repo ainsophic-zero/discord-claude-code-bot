@@ -1149,7 +1149,7 @@ async def _run_scheduled_task(channel, channel_id: str, prompt: str, model: str,
         limit=10 * 1024 * 1024,
     )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(prompt.encode()), timeout=300
+            proc.communicate(prompt.encode()), timeout=1800
         )
         result_text = ""
         for line in stdout.decode(errors="replace").splitlines():
@@ -1445,7 +1445,7 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
                         await push_progress()
 
     try:
-        await asyncio.wait_for(consume_stdout(), timeout=300)
+        await asyncio.wait_for(consume_stdout(), timeout=1800)
     except asyncio.TimeoutError:
         try:
             proc.kill()
