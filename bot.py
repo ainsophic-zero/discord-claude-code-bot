@@ -3839,6 +3839,223 @@ async def slash_novel_model(interaction: discord.Interaction, name: app_commands
         )
 
 
+@bot.tree.command(name="novel_orchestrate", description="フルオーケストレーション執筆（プロデューサー→ライター→レビュー×3→改稿ループ）")
+@app_commands.describe(chapter="第何章？ (2〜14)")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.allowed_installs(guilds=True, users=True)
+async def slash_novel_orchestrate(interaction: discord.Interaction, chapter: int):
+    if chapter < 2 or chapter > 14:
+        await interaction.response.send_message("❌ chapter は 2〜14 で指定", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    await interaction.followup.send("🔌 llama-server 確認中…")
+    if not await _novel_start_llama():
+        await interaction.followup.send("❌ llama-server が起動できませんでした。")
+        return
+
+    # ── bible 読み込み ──────────────────────────────────────
+    await interaction.followup.send(f"📚 第{chapter}章の資料を読み込み中…")
+    try:
+        voice       = (NOVEL_BIBLE_DIR / "ノア口調ガイドライン.md").read_text(encoding="utf-8")
+        structure   = (NOVEL_BIBLE_DIR / "最終章立て.md").read_text(encoding="utf-8")
+        overview    = (NOVEL_BIBLE_DIR / "企画全体像.md").read_text(encoding="utf-8")
+        outline_a   = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントA_日常・整合性.md").read_text(encoding="utf-8"), chapter)
+        outline_b   = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントB_対話・論理.md").read_text(encoding="utf-8"), chapter)
+        outline_c   = _novel_extract_chapter_section(
+            (NOVEL_BIBLE_DIR / "outlines" / "第2〜終章_エージェントC_感情・伏線.md").read_text(encoding="utf-8"), chapter)
+        writer_sys  = (NOVEL_BIBLE_DIR / "agents" / "writer.md").read_text(encoding="utf-8")
+        producer_sys = (NOVEL_BIBLE_DIR / "agents" / "producer.md").read_text(encoding="utf-8")
+        rev_a_sys   = (NOVEL_BIBLE_DIR / "agents" / "reviewer_A_daily.md").read_text(encoding="utf-8")
+        rev_b_sys   = (NOVEL_BIBLE_DIR / "agents" / "reviewer_B_dialogue.md").read_text(encoding="utf-8")
+        rev_c_sys   = (NOVEL_BIBLE_DIR / "agents" / "reviewer_C_emotion.md").read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        await interaction.followup.send(f"❌ 必要なファイルがない: {e}")
+        return
+
+    # 前章末
+    prev_tail = ""
+    if chapter >= 2:
+        pub_dir = NOVEL_CHAPTERS_DIR / "published"
+        for f in sorted(pub_dir.glob(f"*第{chapter-1}章*.md")):
+            prev_tail = f.read_text(encoding="utf-8")[-1000:]
+            break
+    if not prev_tail:
+        for f in sorted((NOVEL_CHAPTERS_DIR / "drafts").glob(f"第{chapter-1}章_本文_opus4.7.md")):
+            prev_tail = f.read_text(encoding="utf-8")[-1000:]
+            break
+
+    state_dir = NOVEL_CHAPTERS_DIR.parent / "state" / f"chapter_{chapter}"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    drafts_dir = NOVEL_CHAPTERS_DIR / "drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+
+    outline_block = f"""# エージェントA（日常・整合性）
+{outline_a}
+
+# エージェントB（対話・論理）
+{outline_b}
+
+# エージェントC（感情・伏線）
+{outline_c}"""
+
+    prev_block = f"\n# 前章の結末\n{prev_tail}" if prev_tail else ""
+
+    # ── STEP 1: プロデューサーが章ブリーフ作成 ──────────────
+    await interaction.followup.send("🎬 **Step 1/5** プロデューサーが章ブリーフを作成中…")
+    brief = await _novel_call_llama(
+        system_prompt=producer_sys,
+        user_prompt=f"""第{chapter}章の執筆ブリーフを作成してください。
+
+# 企画全体像
+{overview[:3000]}
+
+# 最終章立て
+{structure}
+
+# ノア口調ガイドライン
+{voice}
+
+{outline_block}
+{prev_block}
+
+---
+ライターへの指示書（要素リスト・避けるべきこと・一撃フレーズ候補）を出力してください。""",
+        max_tokens=2000, temperature=0.7,
+    )
+    (state_dir / "brief.md").write_text(f"作成日: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}\n\n{brief}", encoding="utf-8")
+
+    # ── STEP 2: ライターが v1 執筆 ───────────────────────────
+    await interaction.followup.send("✍️ **Step 2/5** ライターが v1 を執筆中… (3〜5分)")
+    draft = await _novel_call_llama(
+        system_prompt=writer_sys,
+        user_prompt=f"""【執筆依頼】第{chapter}章の本文を書いてください。
+
+# プロデューサーからのブリーフ
+{brief}
+
+# ノア口調ガイドライン
+{voice}
+
+{outline_block}
+{prev_block}
+
+---
+出力フォーマット：
+
+# 第{chapter}章 [章タイトル]
+
+## 冒頭シーン
+
+## カフェシーン
+
+## 一撃フレーズ
+>
+
+## 実践ワーク
+
+## 章末の引き
+
+本文のみ。メタコメント不要。""",
+        max_tokens=10000, temperature=0.85,
+    )
+
+    v = 1
+    draft_path = drafts_dir / f"第{chapter}章_本文_swallow_v{v}.md"
+    draft_path.write_text(
+        f"作成日: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}\n版: swallow_v{v}\n書き手: Swallow30B\n\n---\n\n{draft}",
+        encoding="utf-8"
+    )
+    char_count = len(draft)
+    await interaction.followup.send(f"📄 v1 完成: {char_count}字")
+
+    # ── STEP 3〜5: レビュー→判定→改稿ループ（最大3周） ─────
+    for loop in range(3):
+        await interaction.followup.send(f"🔍 **レビュー** (ループ {loop+1}/3) — A/B/C 順番にレビュー中…")
+
+        review_prompt = f"""以下の第{chapter}章ドラフトをレビューしてください。
+
+# ノア口調ガイドライン
+{voice}
+
+# ドラフト
+{draft}
+
+---
+指摘は箇条書きで。致命的問題は❌、改善推奨は⚠️、良い点は✅で示す。"""
+
+        rev_a = await _novel_call_llama(rev_a_sys, review_prompt, max_tokens=1500, temperature=0.5)
+        rev_b = await _novel_call_llama(rev_b_sys, review_prompt, max_tokens=1500, temperature=0.5)
+        rev_c = await _novel_call_llama(rev_c_sys, review_prompt, max_tokens=1500, temperature=0.5)
+
+        reviews = f"## レビューA（日常・整合性）\n{rev_a}\n\n## レビューB（対話・論理）\n{rev_b}\n\n## レビューC（感情・伏線）\n{rev_c}"
+        (state_dir / f"reviews_v{v}.md").write_text(reviews, encoding="utf-8")
+
+        # プロデューサー判定
+        await interaction.followup.send("⚖️ プロデューサーが判定中…")
+        verdict = await _novel_call_llama(
+            system_prompt=producer_sys,
+            user_prompt=f"""以下のレビュー結果を統合して判定してください。
+
+{reviews}
+
+---
+出力フォーマット（厳守）：
+## 総合判定
+🟢 合格 / 🟡 軽微修正で合格 / 🔴 要改稿
+
+## 判定根拠（5行以内）
+
+## ライターへの改稿指示（🟡/🔴のみ）
+
+## STATUS
+STATUS=OK / STATUS=MINOR / STATUS=REDO""",
+            max_tokens=1000, temperature=0.6,
+        )
+        (state_dir / f"verdict_v{v}.md").write_text(verdict, encoding="utf-8")
+
+        if "STATUS=OK" in verdict:
+            await interaction.followup.send("✅ **合格！** 改稿不要。")
+            break
+        elif "STATUS=MINOR" in verdict and loop == 2:
+            await interaction.followup.send("🟡 軽微修正推奨だが最大ループ到達。このまま完成扱い。")
+            break
+        elif "STATUS=OK" not in verdict:
+            v += 1
+            await interaction.followup.send(f"🔄 改稿 v{v} 執筆中…")
+            draft = await _novel_call_llama(
+                system_prompt=writer_sys,
+                user_prompt=f"""【改稿依頼】v{v-1}を以下の指示に従って改稿してください。
+
+# プロデューサー判定・改稿指示
+{verdict}
+
+# v{v-1} ドラフト
+{draft}
+
+---
+指摘箇所を手術的に修正。一撃フレーズは維持。本文のみ出力。""",
+                max_tokens=10000, temperature=0.82,
+            )
+            draft_path = drafts_dir / f"第{chapter}章_本文_swallow_v{v}.md"
+            draft_path.write_text(
+                f"作成日: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}\n版: swallow_v{v}\n書き手: Swallow30B\n\n---\n\n{draft}",
+                encoding="utf-8"
+            )
+            await interaction.followup.send(f"📄 v{v} 完成: {len(draft)}字")
+
+    # ── 完成報告 ──────────────────────────────────────────────
+    preview = draft[:500]
+    await interaction.followup.send(
+        f"🎉 **第{chapter}章 オーケストレーション完了！**\n"
+        f"📊 最終: swallow_v{v} / {len(draft)}字\n"
+        f"📁 `{draft_path.name}`\n\n"
+        f"**冒頭プレビュー：**\n```\n{preview}…\n```"
+    )
+
+
 @bot.tree.command(name="novel_llama_stop", description="llama-server を停止してメモリ解放")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -4118,6 +4335,50 @@ async def on_message(message: discord.Message):
 
     await handle_message(message, content)
     await bot.process_commands(message)
+
+
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    """Phase 2B: Discord側でスレッドが作られたとき sessions.db に事前登録する。
+    Phase 2 (bumper) が新 CC セッションを検知した際、同じ work_dir の事前登録スレッドを
+    優先的に使うことで、Discord->Mac の双方向同期を実現する。"""
+
+    # ボット自身が作ったスレッドは Phase 2 が既に登録済みなのでスキップ
+    if thread.owner and thread.owner.bot:
+        return
+
+    thread_id = str(thread.id)
+    parent_id = str(thread.parent_id) if thread.parent_id else None
+
+    if not parent_id:
+        return
+
+    # 親チャンネルの work_dir を sessions.db から取得
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT work_dir FROM sessions WHERE channel_id=?", (parent_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        # 管理外チャンネル（CC連携なし）
+        return
+
+    work_dir = row[0]
+    title = thread.name or ""
+
+    # スレッドを事前登録（session_id は NULL のまま）
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions (channel_id, work_dir, thread_title) VALUES (?,?,?)",
+        (thread_id, work_dir, title)
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"Phase 2B: registered Discord thread {thread_id} for {work_dir[-40:]}")
+
 
 if __name__ == "__main__":
     init_db()

@@ -1,0 +1,16 @@
+[Unit]
+Description=Discord Claude Code Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+EnvironmentFile=-/home/ubuntu/.claude/.env
+EnvironmentFile=/home/ubuntu/discord-bot/.env
+ExecStart=/home/ubuntu/discord-bot/venv/bin/python -u bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

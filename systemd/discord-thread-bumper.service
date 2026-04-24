@@ -1,0 +1,14 @@
+[Unit]
+Description=Discord Thread Activity Bumper (Claude Code session watcher)
+After=network.target discord-claude-bot.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/scripts
+ExecStart=/home/ubuntu/discord-bot/venv/bin/python -u /home/ubuntu/scripts/discord-thread-bumper.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
