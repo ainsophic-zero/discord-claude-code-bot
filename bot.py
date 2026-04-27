@@ -1507,6 +1507,36 @@ intents.dm_messages = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
+# ───────── セキュリティ: ユーザーホワイトリスト ─────────
+# ALLOWED_USER_IDS が未設定/空なら、安全側で全メッセージ拒否
+ALLOWED_USER_IDS = {
+    int(uid) for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    if uid.strip().isdigit()
+}
+if not ALLOWED_USER_IDS:
+    import logging as _logging
+    _logging.warning(
+        "⚠️ ALLOWED_USER_IDS is empty. Bot will reject ALL messages. "
+        "Set ALLOWED_USER_IDS in .env to allow your Discord user ID."
+    )
+
+def _is_allowed_user(user_id: int) -> bool:
+    return user_id in ALLOWED_USER_IDS
+
+# Slash Command の全リクエストを ALLOWED_USER_IDS でフィルタ
+async def _global_interaction_check(interaction: discord.Interaction) -> bool:
+    if _is_allowed_user(interaction.user.id):
+        return True
+    try:
+        await interaction.response.send_message(
+            "⛔ このBotは管理者専用です。利用権限がありません。", ephemeral=True
+        )
+    except Exception:
+        pass
+    return False
+
+bot.tree.interaction_check = _global_interaction_check
+
 # DM・User-install で Slash Commands を使えるようにする
 DM_ALLOWED  = discord.app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
 DM_INSTALLS = discord.app_commands.AppInstallationType(guild=True, user=True)
@@ -2616,15 +2646,23 @@ def _file_emoji(path: Path) -> str:
     return "📄"
 
 def _resolve_path(channel_id: str, subpath: str) -> Path:
-    """セッションのwork_dir基準で相対パスを絶対パスに解決"""
+    """セッションのwork_dir基準で相対パスを絶対パスに解決。
+    base配下のみ許可（path traversal防止）。範囲外指定はbaseに戻す。"""
     row = get_session(channel_id)
     base = Path(row[1]) if row and row[1] else WORK_DIR
+    base_resolved = Path(base).resolve()
     if not subpath or subpath == ".":
-        return base
-    if subpath.startswith("/"):
-        return Path(subpath)
-    # 安全のため WORK_DIR配下かチェック（簡易的に）
-    return (base / subpath).resolve()
+        return base_resolved
+    # 絶対パスは先頭/を剥がし base配下に強制
+    candidate = (base_resolved / subpath.lstrip("/")).resolve()
+    # base 外に出ていないか検証
+    try:
+        candidate.relative_to(base_resolved)
+    except ValueError:
+        import logging as _logging
+        _logging.warning(f"path traversal blocked: ch={channel_id} sub={subpath!r}")
+        return base_resolved
+    return candidate
 
 async def _file_autocomplete(interaction: discord.Interaction, current: str):
     """ファイルパスのオートコンプリート（最大25件）"""
@@ -4310,6 +4348,10 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+
+    # セキュリティ: ホワイトリスト未登録ユーザーは完全無視（auto_respond/mention/DM すべて）
+    if not _is_allowed_user(message.author.id):
         return
 
     is_dm      = isinstance(message.channel, discord.DMChannel)

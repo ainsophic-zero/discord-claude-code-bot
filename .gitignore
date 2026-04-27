@@ -1,5 +1,9 @@
 .env
 sessions.db
+sessions.db.*
+*.bak
+*.bak.*
+*.bak_*
 venv/
 __pycache__/
 *.pyc

@@ -2,79 +2,140 @@
 
 Self-hosted Discord bot that wraps the **Claude Code CLI** so you can use Claude Code from any device (phone, browser, Discord client) — without owning a beefy laptop.
 
+Includes a companion daemon **`discord-thread-bumper`** that mirrors your Mac's Claude Code sessions to Discord forum threads in real time (Mac → Discord) and bumps thread activity timestamps so they stay visible.
+
+---
+
+## ⚠️ SECURITY FIRST — Read this before you run
+
+This bot can execute arbitrary shell commands and edit any file under `WORK_DIR` on the host machine. **Treat the bot token like a root password.**
+
+### MUST DO before going live
+
+1. **Set `ALLOWED_USER_IDS` in `.env`** — without this, the bot rejects all messages by design (fail-secure). Only the listed Discord user IDs can talk to the bot.
+2. **Never commit `.env`** — it's in `.gitignore` already; double-check before `git push`.
+3. **Set `sessions.db` to mode 600** — it stores all conversations including any leaked secrets you may have pasted.
+   ```bash
+   chmod 600 sessions.db
+   ```
+4. **Restrict sudoers** — if your VPS user has `(ALL) NOPASSWD: ALL`, bot compromise = root takeover. Replace with per-command grants (see `systemd/` directory).
+5. **Lock Syncthing GUI** — set a password on `http://127.0.0.1:8384`. Even though it's localhost-only, internal SSRF can reach it.
+
+### Default permission mode is `bypassPermissions` — KNOW THE RISK
+
+`bypassPermissions` mode auto-approves every tool Claude wants to use (Bash, Write, Edit, fetch URLs, etc). This is **fast but dangerous**:
+
+- Compromised bot token → attacker can `rm -rf`, exfiltrate `.env`, install backdoors via Claude
+- Even legitimate users can accidentally tell Claude to do destructive things
+
+**To make it safer**, set in your channel:
+```
+/permission_mode auto       # Claude judges what to ask
+/permission_mode acceptEdits # Edits auto, Bash asked
+/permission_mode default     # Every tool asked (slowest, safest)
+```
+
+Or change the global default in `bot.py` (search for `DEFAULT_PERMISSION_MODE`).
+
+---
+
 ## Features
 
 - **Mention or DM** the bot to chat with Claude (per-channel session continuity)
-- **Mac session takeover**: import an in-progress session from your Mac's Claude Code via `/threads` (uses Syncthing for `~/.claude/projects/` mirror)
-- **Project-aware**: shows folder grouping in the picker, auto-resolves `cwd`
-- **6 permission modes**: `bypassPermissions` (fast/dangerous), `auto` (Claude judges), `acceptEdits`, `default` (every tool asks), `plan` (read-only), `dontAsk`
-- **Permission Buttons**: when in non-bypass mode, pops a Discord embed with `✅ 許可` / `🔁 常に許可` / `❌ 拒否` for any tool Claude wants to use (Bash, Write, Edit, etc). Implemented via `claude-agent-sdk` `PreToolUse` hooks (because the upstream `can_use_tool` callback has [issue #469](https://github.com/anthropics/claude-agent-sdk-python/issues/469))
-- **Session control**: `/clear`, `/recent messages:N` (truncate context), `/threads_recent hours:N`
-- **Personas & templates**: `/persona 執事`, `/template 議事録`, ...
-- **Tool-aware**: `/files`, `/file`, `/audio` (Whisper local), `/image` (Pollinations / Nano Banana / Cloudflare)
-- **`/rewind turns:N`**: git-based rollback of the work directory, with auto backup tag
-- **`/thread name: prompt:`**: spin off a Discord thread for a single task; thread becomes its own session
+- **Mac session takeover**: import in-progress sessions from your Mac via Syncthing-mirrored `~/.claude/projects/`
+- **Mac → Discord mirror** (`discord-thread-bumper`): assistant text from Mac sessions appears live in Discord forum threads
+- **6 permission modes**: `bypassPermissions` / `auto` / `acceptEdits` / `default` / `plan` / `dontAsk`
+- **Permission Buttons**: in non-bypass modes, pops a Discord embed with ✅/🔁/❌ for any tool
+- **Personas & templates**: `/persona 執事`, `/template 議事録`
+- **Tool-aware**: `/files`, `/file`, `/audio` (Whisper local), `/image` (Gemini Nano Banana / Pollinations / Cloudflare)
+- **`/rewind turns:N`**: git-based rollback of work directory
+- **`/thread name: prompt:`**: spin off a Discord thread for one task
 - **Scheduling**: `/schedule_add`, `/schedule_list`, daily report
-- **Reactions** for quick ops: 🔄 retry, 📋 save to Obsidian, 👍 continue, 🗑️ delete
+- **Reactions**: 🔄 retry, 📋 save to Obsidian, 👍 continue, 🗑️ delete
 
-## Requirements
-
-- Python 3.12+
-- `claude` (Claude Code CLI) installed and authenticated
-- A Discord application + bot token
-- *(Optional)* `claude-agent-sdk` for Permission Button support
-- *(Optional)* Syncthing if you want Mac ↔ VPS session sync
-- *(Optional)* Anthropic API key in `ANTHROPIC_API_KEY` if not using OAuth
-
-## Quick start
-
-```bash
-git clone <repo>
-cd discord-bot
-python3 -m venv venv && source venv/bin/activate
-pip install discord.py aiohttp claude-agent-sdk
-
-cp .env.example .env
-# edit .env: DISCORD_TOKEN, WORK_DIR, etc.
-
-python -u bot.py
-```
-
-Recommended: install as systemd service. See `discord-claude-bot.service` example.
-
-## .env
-
-```env
-DISCORD_TOKEN=...
-ANTHROPIC_API_KEY=sk-ant-...   # optional
-WORK_DIR=/path/to/your/projects
-DB_PATH=./sessions.db
-CLAUDE_BIN=claude
-MAX_CONCURRENT=3
-```
-
-## Permission mode behavior
-
-| Mode | Behavior |
-|---|---|
-| `bypassPermissions` | All tools auto-approved. Fastest, dangerous. Uses CLI subprocess directly. |
-| `auto` | Claude decides which tools to ask about. Uses SDK + hook. |
-| `acceptEdits` | File edits auto, Bash etc. asked via Discord buttons. |
-| `default` | Every tool ask. Discord buttons. Read/Glob/Grep auto-allowed for sanity. |
-| `plan` | Read-only. No tool can write. |
-| `dontAsk` | Only pre-approved tools allowed. |
-
-In `default` and similar modes, the bot pops `🔐 ツール実行の承認: <tool>` embed and waits up to 10 minutes. `🔁 常に許可` whitelist is per-channel-session.
+---
 
 ## Architecture
 
 ```
-[Discord] ── on_message ──▶ handle_message ──▶ run_claude ──┬─▶ subprocess `claude` (bypass mode)
-                                                            └─▶ ClaudeSDKClient (other modes)
-                                                                         │
-                                                                         └─PreToolUse hook─▶ DiscordPermissionUI ──▶ embed+buttons
+        ┌─────────────────────────────┐
+        │  Mac: Claude Code (CLI)     │
+        │  ~/.claude/projects/*.jsonl │──┐
+        └─────────────────────────────┘  │ Syncthing
+                                         ▼
+        ┌─────────────────────────────────────────┐
+        │  VPS: ~/.claude/projects/*.jsonl        │
+        │     │                                    │
+        │     ▼ inotify                            │
+        │  bumper: detect new msg → bump + mirror │
+        │     │                                    │
+        │     ▼ Discord API                        │
+        │  Forum thread (one per CC session)      │
+        └────────▲──────────────────────┬─────────┘
+                 │                      │ ⚡ bumps
+                 │ on_message           │ assistant text
+                 │                      ▼
+        ┌─────────────────────────────────────────┐
+        │  bot.py: handle_message → claude CLI    │
+        │     │ (subprocess / claude-agent-sdk)    │
+        │     ▼                                    │
+        │  Discord reply                          │
+        └─────────────────────────────────────────┘
 ```
+
+---
+
+## Requirements
+
+- Python 3.12+
+- Linux VPS (tested on Ubuntu 22.04, Oracle Cloud Ampere A1)
+- `claude` (Claude Code CLI) installed and authenticated
+- Discord application + bot token
+- *(For Mac sync)* Syncthing on Mac and VPS
+- *(Optional)* `claude-agent-sdk` for Permission Button support
+- *(Optional)* Gemini/Cloudflare API keys for image generation
+
+---
+
+## Quick Start
+
+See **[SETUP.md](./SETUP.md)** for full step-by-step instructions including Discord application creation, Syncthing setup, and systemd service installation.
+
+TL;DR:
+
+```bash
+git clone https://github.com/ainsophic-zero/discord-claude-code-bot.git
+cd discord-claude-code-bot
+python3 -m venv venv && source venv/bin/activate
+pip install discord.py aiohttp claude-agent-sdk inotify-simple croniter
+
+cp .env.example .env
+# Edit .env: set ALLOWED_USER_IDS, DISCORD_TOKEN, WORK_DIR
+
+python -u bot.py
+```
+
+For the bumper (Mac → Discord mirror):
+
+```bash
+python -u scripts/discord-thread-bumper.py
+```
+
+---
+
+## Files
+
+| Path | Purpose |
+|------|---------|
+| `bot.py` | Main Discord bot (4385 lines, slash commands, claude exec, permissions) |
+| `scripts/discord-thread-bumper.py` | inotify daemon: Mac → Discord mirror, auto thread creation |
+| `permission_handler.py` | PreToolUse hook for tool approval UI |
+| `systemd/discord-claude-bot.service` | systemd unit for bot |
+| `systemd/discord-thread-bumper.service` | systemd unit for bumper |
+| `.env.example` | Configuration template |
+
+---
 
 ## License
 
-MIT (or your choice)
+MIT
