@@ -630,6 +630,9 @@ def save_work_dir(channel_id: str, new_work_dir: str) -> str | None:
     """作業ディレクトリを変更し、セッションIDをリセット。
     切り替え前のセッションを auto_<日時> としてブランチ保存し、ラベルを返す（復元用）。
     """
+    # Mac側パス → VPS側パスに変換（Syncthing同期対応）
+    if new_work_dir.startswith("/Users/nk/dev/"):
+        new_work_dir = new_work_dir.replace("/Users/nk/dev/", "/home/ubuntu/dev/", 1)
     auto_label = None
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
