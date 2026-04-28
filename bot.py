@@ -1187,6 +1187,10 @@ async def run_claude_sdk(prompt: str, channel_id: str, attachment_texts: list[st
     row = get_session(channel_id)
     session_id = row[0] if row else None
     work_dir   = Path(row[1]) if row else WORK_DIR
+    # Mac側パス → VPS側パスに変換（Syncthing同期対応）
+    work_dir_str = str(work_dir)
+    if work_dir_str.startswith("/Users/nk/dev/"):
+        work_dir = Path(work_dir_str.replace("/Users/nk/dev/", "/home/ubuntu/dev/", 1))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     full_prompt = prompt
@@ -1328,6 +1332,10 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
     row = get_session(channel_id)
     session_id = row[0] if row else None
     work_dir   = Path(row[1]) if row else WORK_DIR
+    # Mac側パス → VPS側パスに変換（Syncthing同期対応）
+    work_dir_str = str(work_dir)
+    if work_dir_str.startswith("/Users/nk/dev/"):
+        work_dir = Path(work_dir_str.replace("/Users/nk/dev/", "/home/ubuntu/dev/", 1))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     full_prompt = prompt
