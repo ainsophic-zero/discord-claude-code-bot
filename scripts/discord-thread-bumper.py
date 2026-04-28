@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Discord Thread Activity Bumper v6 (Forum Edition + Mac→Discord Mirror)
+Discord Thread Activity Bumper v7 (Forum Edition + Mac→Discord Mirror + Title Sync)
 - v5機能継承
 - v6: Mac側で書かれた会話 (cwd=/Users/...) をDiscordフォーラム投稿にミラー
   - VPS bot経由で書かれた応答 (cwd=/home/ubuntu/...) はスキップ（Discordに既出）
   - sessions.db.last_mirrored_uuid で増分管理
   - 起動時：未初期化セッションは現JSONL末尾を「処理済み」とする → 過去分は送られない
+- v7: Mac→Discord タイトル同期（一方向）
+  - .jsonl の metadata.title を監視
+  - last_known_title と比較して変更時のみ Discord API で PATCH
+  - タイトル長100文字制限で自動 truncate
 
 Loop prevention: posts as bot; on_message ignores bot messages.
 Debounce: 30s per session for bumping, 10s for new-session creation.
@@ -431,6 +435,48 @@ def post_message(channel_id: str, content: str) -> bool:
     return False
 
 
+
+# ─── タイトル更新レート制限（30分に3回まで、Mac優先） ───
+title_update_history: dict[str, list[float]] = {}
+
+def can_update_title(channel_id: str, max_per_30min: int = 3) -> bool:
+    now = time.time()
+    hist = title_update_history.get(channel_id, [])
+    hist = [ts for ts in hist if ts > now - 1800]
+    title_update_history[channel_id] = hist
+    return len(hist) < max_per_30min
+
+def record_title_update(channel_id: str):
+    title_update_history.setdefault(channel_id, []).append(time.time())
+
+
+def update_thread_title(channel_id: str, new_title: str) -> bool:
+    """Discordスレッド/フォーラム投稿のタイトル更新。100文字制限。"""
+    title = new_title[:100] if len(new_title) > 100 else new_title
+    try:
+        r = requests.patch(
+            f"{API}/channels/{channel_id}",
+            headers=H,
+            json={"name": title},
+            timeout=15
+        )
+        if r.status_code == 429:
+            wait = r.json().get('retry_after', 5)
+            time.sleep(wait + 0.5)
+            r = requests.patch(
+                f"{API}/channels/{channel_id}",
+                headers=H,
+                json={"name": title},
+                timeout=15
+            )
+        if r.status_code == 200:
+            return True
+        log.warning(f"update_thread_title fail {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        log.error(f"update_thread_title exc: {e}")
+    return False
+
+
 def _extract_text_from_content(content) -> str:
     """str か list[dict] の content から発話テキストだけ抽出。
     tool_use, tool_result, image, thinking は無視。"""
@@ -463,6 +509,32 @@ def _is_system_noise(s: str) -> bool:
     if s.startswith("<") and s.endswith(">") and "\n" not in s and len(s) < 200:
         return True
     return False
+
+
+def read_title_from_jsonl(jsonl_path: str) -> str | None:
+    """JSONLから現在のタイトルを取得。優先: custom-title (最新) > metadata.title。
+    custom-title はユーザーが Claude Code 上で付けたカスタム名。"""
+    custom_title = None
+    metadata_title = None
+    try:
+        with open(jsonl_path, 'r', errors='replace') as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    t = d.get("type")
+                    if t == "custom-title":
+                        ct = d.get("customTitle")
+                        if ct and ct.strip():
+                            custom_title = ct.strip()  # 最後の出現が最新
+                    elif t == "metadata":
+                        mt = d.get("title")
+                        if mt and mt.strip():
+                            metadata_title = mt.strip()
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return custom_title or metadata_title
 
 
 def extract_messages_after(jsonl_path: str, last_uuid):
@@ -503,7 +575,48 @@ def extract_messages_after(jsonl_path: str, last_uuid):
 
 
 def mirror_to_discord(channel_id: str, session_id: str, jsonl_path: str):
-    """Mac起源の新規メッセージをDiscordフォーラム投稿にミラー。"""
+    """Mac起源の新規メッセージをDiscordフォーラム投稿にミラー。
+    v7: タイトル同期（Mac→Discord一方向）追加。"""
+
+    # タイトル同期チェック
+    current_title = read_title_from_jsonl(jsonl_path)
+    if current_title:
+        con = sqlite3.connect(DB_PATH)
+        try:
+            r = con.execute(
+                "SELECT last_known_title FROM sessions WHERE channel_id=?",
+                (channel_id,)
+            ).fetchone()
+            last_title = r[0] if r and r[0] else None
+        finally:
+            con.close()
+
+        if current_title != last_title:
+            if not can_update_title(channel_id):
+                log.warning(f"title rate-limit ch={channel_id[:18]} (>3/30min) skip")
+                con = sqlite3.connect(DB_PATH)
+                try:
+                    con.execute(
+                        "UPDATE sessions SET last_known_title=? WHERE channel_id=?",
+                        (current_title, channel_id)
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+            elif update_thread_title(channel_id, current_title):
+                record_title_update(channel_id)
+                con = sqlite3.connect(DB_PATH)
+                try:
+                    con.execute(
+                        "UPDATE sessions SET last_known_title=? WHERE channel_id=?",
+                        (current_title, channel_id)
+                    )
+                    con.commit()
+                    log.info(f"title synced: ch={channel_id} '{current_title[:50]}'")
+                finally:
+                    con.close()
+
+    # メッセージミラー
     con = sqlite3.connect(DB_PATH)
     try:
         r = con.execute(
@@ -750,9 +863,31 @@ def periodic_scan():
         log.info(f"periodic_scan: {new_found} new sessions registered")
 
 
+# ─────────────────────────── DB migration ───────────────────────────
+
+def ensure_schema():
+    """v7: last_known_title カラム追加（Mac→Discord タイトル同期用）"""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        # カラム存在チェック
+        cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()]
+        if "last_known_title" not in cols:
+            con.execute("ALTER TABLE sessions ADD COLUMN last_known_title TEXT")
+            con.commit()
+            log.info("schema migration: added last_known_title column")
+    finally:
+        con.close()
+
+
 # ─────────────────────────── main loop ───────────────────────────
 
 def main():
+    # v7: スキーママイグレーション
+    try:
+        ensure_schema()
+    except Exception as e:
+        log.error(f"ensure_schema error: {e}")
+
     inotify = INotify()
     # v6: MODIFY追加（appendを拾う）+ MOVE_SELF/DELETE_SELF（Syncthing rename対応）
     wf = (flags.MODIFY | flags.CLOSE_WRITE | flags.MOVED_TO |
@@ -775,7 +910,7 @@ def main():
             add_dir_watch(d)
     parent_wd = inotify.add_watch(str(PROJECTS_DIR), pf)
     wds[parent_wd] = PROJECTS_DIR
-    log.info(f"watching {len(wds)-1} project dirs (v6: Mirror Edition)")
+    log.info(f"watching {len(wds)-1} project dirs (v7: Title Sync Edition)")
 
     try:
         startup_scan()
