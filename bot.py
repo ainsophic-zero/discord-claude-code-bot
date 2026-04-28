@@ -230,6 +230,17 @@ PERMISSION_MODES = {
 }
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
+# モデルが空の応答を返した時に表示する案内（旧「（応答なし）」を置換）
+EMPTY_RESPONSE_MSG = (
+    "⚠️ モデルから応答が返ってきませんでした。\n\n"
+    "試してみてください:\n"
+    "• `/model sonnet` でモデル切替\n"
+    "• `/clear` でセッションリセット\n"
+    "• 同じプロンプトを再送"
+)
+
+
+
 def get_permission_mode(channel_id: str) -> str:
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
@@ -1163,7 +1174,7 @@ async def _run_scheduled_task(channel, channel_id: str, prompt: str, model: str,
             if event.get("type") == "result":
                 result_text = event.get("result", "")
         if not result_text:
-            result_text = "（応答なし）"
+            result_text = EMPTY_RESPONSE_MSG
         for chunk in split_message(result_text):
             await channel.send(chunk)
     except Exception as e:
@@ -1271,14 +1282,14 @@ async def run_claude_sdk(prompt: str, channel_id: str, attachment_texts: list[st
                             ))
                             await push_progress()
                 elif t == "ResultMessage":
-                    result_text = msg.result or "（応答なし）"
+                    result_text = msg.result or EMPTY_RESPONSE_MSG
                     new_session_id = getattr(msg, "session_id", session_id) or session_id
                     break
     except Exception as e:
         result_text = f"⚠️ SDK実行エラー: `{type(e).__name__}: {str(e)[:300]}`"
 
     if not result_text:
-        result_text = "（応答なし）"
+        result_text = EMPTY_RESPONSE_MSG
 
     if new_session_id:
         save_session(channel_id, new_session_id, str(work_dir), model, persona)
@@ -1443,7 +1454,7 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
                 continue
             etype = event.get("type", "")
             if etype == "result":
-                result_text    = event.get("result", "（応答なし）")
+                result_text    = event.get("result") or EMPTY_RESPONSE_MSG
                 new_session_id = event.get("session_id", session_id)
             elif etype == "assistant":
                 msg = event.get("message", {}) or {}
@@ -1471,7 +1482,7 @@ async def run_claude(prompt: str, channel_id: str, attachment_texts: list[str],
             err = (await proc.stderr.read()).decode(errors="replace")
             result_text = f"⚠️ エラー:\n```\n{err[:1500]}\n```"
         except Exception:
-            result_text = "（応答なし）"
+            result_text = EMPTY_RESPONSE_MSG
 
     if new_session_id:
         save_session(channel_id, new_session_id, str(work_dir), model, persona)
